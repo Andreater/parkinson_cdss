@@ -1,0 +1,15 @@
+---
+default:
+  cores: 2
+  debug: true
+  server: "localhost:5555"
+  
+metabuild:
+  parent: !expr dirname(dirname(getwd()))
+  
+exp1:
+  parent: !expr dirname(dirname(getwd()))
+  datapath: "data/genetic_data/RNA_seq/counts"
+  rna.meta.path: "data/intermediate/metadata"
+  lcf.out: "data/intermediate/exp1/RNAseq/lcf"
+  udf.path: "r/scripts"
