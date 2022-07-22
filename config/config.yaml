@@ -11,5 +11,10 @@ exp1:
   parent: !expr dirname(dirname(getwd()))
   datapath: "data/genetic_data/RNA_seq/counts"
   rna.meta.path: "data/intermediate/metadata"
+  metadata_rna: "our RNA seq metadata updated with analytic cohort info.rds"
   lcf.out: "data/intermediate/exp1/RNAseq/lcf"
   udf.path: "r/scripts"
+  fit_types: !expr c("parametric", "local", "mean")
+  group_names: !expr c("hc_lcf", "pd_lcf")
+  vst.count.list.names: !expr c("hc_lcf_vst", "pd_lcf_vst")
+  vst.out: "data/intermediate/exp1/RNAseq/vst"
