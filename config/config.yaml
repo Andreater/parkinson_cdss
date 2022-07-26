@@ -18,3 +18,10 @@ exp1:
   group_names: !expr c("hc_lcf", "pd_lcf")
   vst.count.list.names: !expr c("hc_lcf_vst", "pd_lcf_vst")
   vst.out: "data/intermediate/exp1/RNAseq/vst"
+  vst.ff.out: "data/intermediate/exp1/RNAseq/vst_ff"
+  vst.ff.stats: "data/intermediate/exp1/RNAseq/vst_ff/ff stats"
+  featurefilter: "MAD"
+
+clustering:
+  prep_methods: !expr c("lcf", "lcf_vst", "lcf_vst_cs")
+  random_df: "data/intermediate/exp1/RNAseq/clustering/random df.csv"
