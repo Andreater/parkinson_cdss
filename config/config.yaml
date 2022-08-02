@@ -1,6 +1,6 @@
 ---
 default:
-  cores: 2
+  cores: 19
   debug: true
   server: "localhost:5555"
   
@@ -23,5 +23,19 @@ exp1:
   featurefilter: "MAD"
 
 clustering:
-  prep_methods: !expr c("lcf", "lcf_vst", "lcf_vst_cs")
-  random_df: "data/intermediate/exp1/RNAseq/clustering/random df.csv"
+  prep_methods: !expr c("lcf", "lcf_vst", "lcf_vst_cs", "lcf_vst_ff", "lcf_vst_ff_cs")
+  random_df: "data/intermediate/exp1/RNAseq/clustering"
+  ctend.out: "data/intermediate/exp1/RNAseq/clustering/clustering tendency results"
+  hopkins.out: "hopkins"
+  VAT_out: "vat"
+  VAT_method: "euclidean"
+  IVAT_method: "euclidean"
+  IVAT_out: "ivat"
+  diss_out: "dissimilarity plots"
+  IVAT_dissimilarity_method: "OLO_single"
+  corr.out: "correlation"
+  correlation_methods: !expr c("pearson", "spearman")
+  M3C_alg: !expr c("pam", "km", "spectral", "hc")
+  M3C_obj_fun: !expr c("entropy", "PAC")
+  M3C_ref_meth: !expr c("reverse-pca", "chol")
+  M3C.out: "m3c/method1"
