@@ -121,6 +121,8 @@ fviz_pca_ind(entropy.pca,
 M3C::tsne(t(entropy.counts), labels = entropy.demo$label %>% as.character())
 
 M3C::umap(t(entropy.counts), labels = entropy.demo$label %>% as.character())
+
+saveRDS(entropy.pca, file = config$clustering$entropy.pca.out)
 ```
 
 ## Silhouette
