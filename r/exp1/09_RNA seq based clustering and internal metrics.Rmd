@@ -1,0 +1,340 @@
+---
+title: "09"
+author: "Andrea Termine"
+date: "2022-09-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../../config/config.yaml", eval.expr=TRUE)
+
+# Paths
+udf.path        = file.path(config$exp1$parent, config$exp1$udf.path)
+data.path       = file.path(config$exp1$parent, config$exp1$datapath)
+rna.meta.path   = file.path(config$exp1$parent, config$exp1$rna.meta.path)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(file.path(udf.path, "functions.r"))
+
+## Required Packages
+pkg = c("tidyverse", "yaml", "fst",
+        "FactoMineR", "factoextra", "mclust",
+        "fpc", "dbscan",
+        "clusterCrit", "openxlsx")
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+```{r import, message=FALSE, warning=FALSE}
+# import metadata ----
+rna_seq_metadata = readRDS(file.path(rna.meta.path, config$exp1$metadata_rna))
+
+# import counts ----
+entropy.counts = fst::read.fst(path = config$clustering_after_m3c$count.path)
+entropy.counts = entropy.counts %>% column_to_rownames("PATNO")
+```
+
+## Summary
+
+We will fit many combination of algorithms to compare their silhouette and other internal measures with the solution proposed by m3c.
+
+### Partitioning clustering
+
+```{r}
+## Fitting ----
+partitioning_dist = c("kmeans", "pam", "clara")
+
+# Creating list
+part_clust        = vector(mode = 'list', length = length(partitioning_dist))
+names(part_clust) = partitioning_dist
+
+# Executing eclust function on all FUNclusters an hc_methods
+for (i in 1:length(partitioning_dist)) {
+  print(paste(partitioning_dist[i]))
+
+  # Fit
+  part_clust[[i]] = eclust(entropy.counts,
+                           FUNcluster = partitioning_dist[[i]],
+                           k = 2)
+}
+
+## Results extraction ----
+# Initialize storage for results
+part_res = vector(mode = "list", length = length(part_clust))
+names(part_res) = names(part_clust)
+
+for (i in 1:length(part_clust)) {
+  # Onboarding
+  print(partitioning_dist[i])
+  
+  # Compute the internal validation metrics
+  intCriteria = intCriteria(traj = entropy.counts %>% as.matrix,
+                            part = part_clust[[i]]$cluster,
+                            crit = c("C_index","Calinski_Harabasz","Dunn", "Silhouette"))  
+  
+  # Create a dataframe from the intCriteria list
+  part_res[[i]] =  data.frame(type               = "partitioning methods",
+                              linkage            = NA_character_,
+                              distance           = "euclidean",
+                              clustering_method  = partitioning_dist[i],
+                              method             = names(intCriteria),
+                              value              = intCriteria %>% paste(sep = "") %>% as.numeric())
+  
+  # # export the cluster plot
+  # ggsave(filename = file.path(config$clustering_after_m3c$clres.out, paste0(names(part_clust)[i], ".png")),
+  #        plot     = part_clust[[i]][["clust_plot"]] + labs(title = names(part_clust)[i]),
+  #        width    = 18,
+  #        height   = 20,
+  #        units    = "cm",
+  #        device   = "png",
+  #        dpi      = 300)
+  
+}
+part_res = part_res %>% reduce(bind_rows)
+saveRDS(part_clust, file = file.path(config$clustering_after_m3c$clres.out, "partitioning clustering objects.rds"))
+part_res %>% write.xlsx(file.path(config$clustering_after_m3c$clres.out, "partitioning clustering results.xlsx"))
+```
+
+## hierarchical clustering
+
+```{r}
+# Creating "FUNcluster"" and "hc_method"" factor for eclust
+vec1 = c("hclust", "agnes", "diana")
+vec2 = c("ward.D", "ward.D2", "single", "complete", "average")
+vec3 = c("euclidean", "manhattan", "maximum", "canberra", "binary", "minkowski","pearson", "spearman")
+
+
+# Creating tri-dimensional list for hierarchical clustering results
+h_clust        = rec.list(len = c(3,5,8))
+names(h_clust) = vec1
+
+# Executing eclust function on all FUNclusters an hc_methods
+for (i in 1:length(vec1)) {
+  for (w in 1:length(vec2)) {
+    for (k in 1:length(vec3)) {
+      print(paste(vec1[i], vec2[w], vec3[k]))
+      h_clust[[i]][[w]][[k]] = try(eclust(entropy.counts,
+                                          FUNcluster = vec1[[i]],
+                                          k = 2,
+                                          hc_metric = vec3[[k]],
+                                          hc_method = vec2[[w]]))
+      
+      names(h_clust[[i]])[[w]] = vec2[w]
+      names(h_clust[[i]][[w]])[[k]] = vec3[k] 
+      
+    }
+  }
+}
+
+h_clust_res = vector(mode = "list", length = 3*5*8)
+
+iv = 1
+
+for (i in 1:length(vec1)) {
+  for (ii in 1:length(vec2)) {
+    for (iii in 1:length(vec3)) {
+      print(paste(names(h_clust)[i], names(h_clust[[i]])[ii], names(h_clust[[i]][[ii]])[[iii]]))
+      
+      # Compute the internal validation metrics
+      intCriteria = intCriteria(traj = entropy.counts %>% as.matrix,
+                                part = h_clust[[i]][[ii]][[iii]]$cluster,
+                                crit = c("C_index","Calinski_Harabasz","Dunn", "Silhouette"))  
+      
+      # Create a dataframe from the intCriteria list
+      h_clust_res[[iv]] =  data.frame(type               = "agglomerative methods",
+                                     linkage            = names(h_clust[[i]][[ii]])[[iii]],
+                                     distance           = names(h_clust[[i]])[[ii]],
+                                     clustering_method  = names(h_clust)[i],
+                                     method             = names(intCriteria),
+                                     value              = intCriteria %>% paste(sep = "") %>% as.numeric())
+      iv = iv + 1
+    }
+  }
+}
+
+saveRDS(h_clust, file = file.path(config$clustering_after_m3c$clres.out, "hierarchical or agglomerative clustering objects.rds"))
+h_clust_res = h_clust_res %>% reduce(bind_rows)
+h_clust_res  %>% write.xlsx(file.path(config$clustering_after_m3c$clres.out, "hierarchical or agglomerative clustering results.xlsx"))
+```
+
+## Advanced clustering
+
+### Hierarchical kmeans
+
+```{r fitting}
+hc.metric = c("euclidean", "maximum", "manhattan", "canberra", "binary", "minkowski")
+hc.method = c("ward.D", "ward.D2", "single", "complete", "average", "mcquitty", "median", "centroid")
+
+h_kmeans_clust = vector(mode = "list", length(hc.metric))
+
+for (i in 1:length(h_kmeans_clust)) {
+  h_kmeans_clust[[i]] = vector(mode = "list", length = length(hc.method))
+  names(h_kmeans_clust[[i]]) = hc.method
+  names(h_kmeans_clust) = names(hc.metric)
+}
+
+names(h_kmeans_clust) = hc.metric
+
+for (i in 1:length(h_kmeans_clust)) {
+  for (k in 1:length(hc.method)) {
+    print(paste(hc.metric[i],hc.method[k] ))
+    h_kmeans_clust[[i]][[k]] = try(hkmeans(entropy.counts,
+                                           k = 2,
+                                           hc.metric = hc.metric[i],
+                                           hc.method = hc.method[k]))
+  }
+}
+
+h_kmeans_res = vector(mode = "list", length = length(hc.method)*length(hc.method))
+
+iv = 1
+for (i in 1:length(h_kmeans_clust)) {
+  for (ii in 1:length(h_kmeans_clust)) {
+    print(paste(hc.metric[i],hc.method[k]))
+    
+    # Compute the internal validation metrics
+    intCriteria = intCriteria(traj = entropy.counts %>% as.matrix,
+                              part = h_kmeans_clust[[i]][[ii]]$cluster,
+                              crit = c("C_index","Calinski_Harabasz","Dunn", "Silhouette")) 
+    
+    # Create a dataframe from the intCriteria list
+    h_kmeans_res[[iv]] =  data.frame(type               = "agglomerative methods",
+                                     linkage            = names(h_kmeans_clust)[i],
+                                     distance           = names(h_kmeans_clust[[i]])[ii],
+                                     clustering_method  = "hierarchical kmeans",
+                                     method             = names(intCriteria),
+                                     value              = intCriteria %>% paste(sep = "") %>% as.numeric())
+    iv = iv + 1
+  }
+}
+
+h_kmeans_res = h_kmeans_res %>% reduce(bind_rows)
+
+saveRDS(h_kmeans_clust, file = file.path(config$clustering_after_m3c$clres.out, "hierarchical kmeans with agglomerative clustering objects.rds"))
+h_kmeans_res %>% write.xlsx(file.path(config$clustering_after_m3c$clres.out, "hierarchical kmeans with agglomerative clustering results.xlsx"))
+```
+
+### Fuzzy clustering
+
+
+```{r}
+metric = c("euclidean", "manhattan", "SqEuclidean")
+
+fuzzy_clust = vector(mode = "list", length = length(metric))
+names(fuzzy_clust) = metric
+
+
+for (i in 1:length(metric)) {
+  print(metric[i])
+  fuzzy_clust[[i]] = try(cluster::fanny(entropy.counts,
+                                        diss = FALSE,
+                                        stand = FALSE,
+                                        metric = metric[i],
+                                        k      = 2))
+  
+}
+
+fuzzy_res = vector(mode = "list", length = length(metric))
+
+for (i in 1:length(fuzzy_clust)) {
+  # Onboarding
+  print(metric[i])
+  
+  # Compute the internal validation metrics
+  intCriteria = intCriteria(traj = entropy.counts %>% as.matrix,
+                            part = fuzzy_clust[[i]]$clustering,
+                            crit = c("C_index","Calinski_Harabasz","Dunn", "Silhouette"))  
+  
+  # Create a dataframe from the intCriteria list
+fuzzy_res[[i]] =  data.frame(type               = "advanced methods",
+                              linkage            = NA_character_,
+                              distance           = metric[i],
+                              clustering_method  = "fuzzy clustering",
+                              method             = names(intCriteria),
+                              value              = intCriteria %>% paste(sep = "") %>% as.numeric())
+  
+}
+
+fuzzy_res = fuzzy_res %>% reduce(bind_rows)
+
+saveRDS(fuzzy_clust, file = file.path(config$clustering_after_m3c$clres.out, "fuzzy clustering objects.rds"))
+fuzzy_res %>% write.xlsx(file.path(config$clustering_after_m3c$clres.out, "fuzzy clustering results.xlsx"))
+```
+
+### model based (Gaussian Mixture Models)
+
+```{r}
+model_based_clust = Mclust(entropy.counts,
+                           G          = 2,
+                           modelNames = c("EII", "VII", "EEI", "EVI", "VEI", "VVI"))
+
+# Compute the internal validation metrics
+intCriteria = intCriteria(traj = entropy.counts %>% as.matrix,
+                          part = model_based_clust$classification %>% as.integer(),
+                          crit = c("C_index","Calinski_Harabasz","Dunn", "Silhouette"))  
+
+# Create a dataframe from the intCriteria list
+model_based_res =  data.frame(type               = "advanced methods",
+                              linkage            = NA_character_,
+                              distance           = NA_character_,
+                              clustering_method  = "Model Based (Gaussian Mixture Model) - VEI",
+                              method             = names(intCriteria),
+                              value              = intCriteria %>% paste(sep = "") %>% as.numeric())
+
+saveRDS(model_based_clust, file = file.path(config$clustering_after_m3c$clres.out, "model based gaussian mixture model object.rds"))
+model_based_res %>% write.xlsx(file.path(config$clustering_after_m3c$clres.out, "model based guassian mixture model results.xlsx"))
+```
+
+## Non flat Geometry clustering
+
+Non-flat geometry clustering is useful when the clusters have a specific shape, i.e. a non-flat manifold, and the standard euclidean distance is not the right metric. This not the case of our data, as demonstrated in the following runs.
+
+### DBSCAN
+
+As you can see from the plot DBSCAN fails with flat geometries and therefore we will not use non flat geometry clustering.
+
+```{r}
+## Produce a k-NN distance plot to determine a suitable eps for
+## DBSCAN with MinPts = 5. Use k = 4 (= MinPts -1).
+kNNdistplot(entropy.counts, k = 4)
+abline(h = 0.15, lty = 2)
+
+dbscan = dbscan::dbscan(x      = entropy.counts,
+                        eps    = 54,
+                        minPts = 5)
+# Note that the black dot are outliers for dbscan
+dbscan_plot = fviz_cluster(object          = dbscan,
+                           data            = entropy.counts,
+                           stand           = FALSE,
+                           ellipse         = TRUE, 
+                           show.clust.cent = TRUE,
+                           labelsize       = 0,
+                           geom            = "point")
+
+save(dbscan, dbscan_plot, file = file.path(config$clustering_after_m3c$clres.out, "dbscan object and plot.rdata"))
+
+# export the cluster plot
+ggsave(filename = file.path(config$clustering_after_m3c$clres.out, "dbscan plot.png"),
+       plot     = dbscan_plot,
+       width    = 18,
+       height   = 20,
+       units    = "cm",
+       device   = "png",
+       dpi      = 300)
+
+```
+
+### Internal metrics check

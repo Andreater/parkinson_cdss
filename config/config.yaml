@@ -39,3 +39,14 @@ clustering:
   M3C_obj_fun: !expr c("entropy", "PAC")
   M3C_ref_meth: !expr c("reverse-pca", "chol")
   M3C.out: "m3c/method1"
+  entropy.solution: "E:/ppmi/data/intermediate/exp1/RNAseq/clustering/clustering tendency results/m3c/method1/entropy/km/chol/pd_lcf_vst_mean_ff_centerscale_counts.rds"
+  pac.solution: "E:/ppmi/data/intermediate/exp1/RNAseq/clustering/clustering tendency results/m3c/method1/pac/km/chol/pd_lcf_vst_local_ff_centerscale_counts.rds"
+  entropy.dataset: "pd_lcf_vst_mean_ff_centerscale_counts"
+  pac.dataset: "pd_lcf_vst_local_ff_centerscale_counts"
+  m3c.internal.metrics: "E:/ppmi/data/intermediate/exp1/RNAseq/clustering/m3c internal metrics clustering.xlsx"
+  m3c.cluster.labels: "E:/ppmi/data/intermediate/exp1/RNAseq/clustering/m3c pd labels.xlsx"
+  entropy.pca.out: "E:/ppmi/data/intermediate/exp1/RNAseq/clustering/entropy pca.rds"
+
+clustering_after_m3c:
+  count.path: !expr file.path(dirname(dirname(getwd())), "data", "intermediate", "exp1", "RNAseq", "vst_ff", paste0("pd_lcf_vst_mean_ff_centerscale_counts",".fst"))
+  clres.out: "E:/ppmi/data/intermediate/exp1/RNAseq"
