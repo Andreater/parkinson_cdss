@@ -5,6 +5,6 @@ default:
   server: "localhost:5555"
 
 additionalClustering:
-  dataDir: "data/intermediate/exp1/RNAseq"
+  dataDir: "../data/intermediate/exp1/RNAseq"
   countFile: "counts.csv"
   countPath: ${additionalClustering.dataDir}/${additionalClustering.countFile}
