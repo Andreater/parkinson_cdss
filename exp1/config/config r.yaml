@@ -1,0 +1,52 @@
+---
+default:
+  cores: 19
+  debug: true
+  server: "localhost:5555"
+
+exp:
+  parent: !expr dirname(dirname(getwd()))
+
+file_05:
+  count_dir: "data/genetic_data/RNA_seq/counts"
+  rna_meta_dir: "metadata"
+  rna_meta_name: "our RNA seq metadata updated with analytic cohort info.rds"
+  lcf_out: "../data/RNAseq/lcf"
+  udf_dir: "scripts"
+  udf_name: "functions.r"
+  fit_types: !expr c("parametric", "local", "mean")
+  group_names: !expr c("hc_lcf", "pd_lcf")
+  vst_count_list_names: !expr c("hc_lcf_vst", "pd_lcf_vst")
+  vst_out: "../data/RNAseq/vst"
+  vst_ff_out: "../data/RNAseq/vst_ff"
+  vst_ff_stats: "../data/RNAseq/vst_ff/ff stats"
+  featurefilter: "MAD"
+
+clustering:
+  prep_methods: !expr c("lcf", "lcf_vst", "lcf_vst_cs", "lcf_vst_ff", "lcf_vst_ff_cs")
+  random_df: "../data/RNAseq/clustering"
+  ctend_out: "../data/RNAseq/clustering/clustering tendency results"
+  hopkins_out: "hopkins"
+  VAT_out: "vat"
+  VAT_method: "euclidean"
+  IVAT_method: "euclidean"
+  IVAT_out: "ivat"
+  diss_out: "dissimilarity plots"
+  IVAT_dissimilarity_method: "OLO_single"
+  corr_out: "correlation"
+  correlation_methods: !expr c("pearson", "spearman")
+  M3C_alg: !expr c("pam", "km", "spectral", "hc")
+  M3C_obj_fun: !expr c("entropy", "PAC")
+  M3C_ref_meth: !expr c("reverse-pca", "chol")
+  M3C_out: "m3c/method1"
+  entropy_solution: "../data/RNAseq/clustering/clustering tendency results/m3c/method1/entropy/km/chol/pd_lcf_vst_mean_ff_centerscale_counts_rds"
+  pac_solution: "../data/RNAseq/clustering/clustering tendency results/m3c/method1/pac/km/chol/pd_lcf_vst_local_ff_centerscale_counts_rds"
+  entropy_dataset: "pd_lcf_vst_mean_ff_centerscale_counts"
+  pac_dataset: "pd_lcf_vst_local_ff_centerscale_counts"
+  m3c_internal_metrics: "../data/RNAseq/clustering/m3c internal metrics clustering_xlsx"
+  m3c_cluster_labels: "../data/RNAseq/clustering/m3c pd labels_xlsx"
+  entropy_pca_out: "../data/RNAseq/clustering/entropy pca_rds"
+
+clustering_after_m3c:
+  count_path: !expr file.path(dirname(getwd()), "data", "RNAseq", "vst_ff", paste0("pd_lcf_vst_mean_ff_centerscale_counts",".fst"))
+  clres_out: "E:/ppmi/data/intermediate/exp1/RNAseq"

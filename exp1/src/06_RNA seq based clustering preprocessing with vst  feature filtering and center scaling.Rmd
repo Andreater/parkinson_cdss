@@ -1,0 +1,294 @@
+---
+title: "Untitled"
+author: "Andrea Termine"
+date: '2022-07-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../config/config r.yaml", eval.expr=TRUE)
+
+# Paths
+data.path       = file.path(config$exp$parent, config$file_05$datapath)
+rna.meta.path   = file.path(config$exp$parent, config$file_05$rna_meta_dir)
+lcf.out         = config$file_05$lcf.out
+udf.path        = file.path(config$exp$parent, config$file_05$udf_dir)
+vst.out         = config$file_05$vst.out
+vst.ff.out      = config$file_05$vst.ff.out
+vst.ff.stats.out= config$file_05$vst.ff.stats
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(file.path(udf.path, config$file_05$udf_name))
+
+## Required Packages
+pkg = c("tidyverse", "yaml", "fst",
+        "biocManager","DESeq2", "M3C")
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+# Aim
+
+01 - Apply VST
+02 - Apply center and scaling
+
+
+# A note about the import
+
+We tried to import the data using rds and parLapply or for each solutions. Since we had only two files they used only two cores and it was really slow. You could split in multiple small files or use the fst solution. Sources are listed below.
+
+- [fst site](https://www.fstpackage.org/)
+- [benchmark](https://waterdata.usgs.gov/blog/formats/)
+
+```{r import}
+# import metadata
+rna_seq_metadata = readRDS(file.path(rna.meta.path, config$file_05$rna_meta_name))
+
+
+
+# LCF counts import ----
+
+## Prepare the import
+count.paths = list.files(path       = lcf.out,
+                         pattern    = ".fst",
+                         full.names = T)
+
+# storage object
+count.list = vector(mode = "list", length = length(count.paths))
+names(count.list) = list.files(path       = lcf.out,
+                               pattern    = ".fst",
+                               full.names = F) %>% word(sep = " ")
+
+## Perform the import
+pb = txtProgressBar(min = 0, max = length(count.list), initial = 0) 
+
+for (i in 1:length(count.list)) {
+  count.list[[i]] = read_fst(path = count.paths[i])
+  
+  setTxtProgressBar(pb = pb, value = i)
+}
+close(pb)
+```
+
+# VST Transformation
+
+01 - Recreate the reproducible example from DESeq2 [V]
+02 - Prepare counts for vst (wide format)          [V]
+03 - Apply vst to our count matrices               [V]
+04 - Apply feature filter after vst                [V]
+05 - Create a vst_counts version with center/scale [V]
+06 - Export vst and vst/centerscaled counts        [V]
+
+You could create a dds object right now, but at this step I prefer to stick with the matrix/dataframe r objects. The variance stabilizing transformation is the main function that is usually called using vst. There are small differences that make the first function better if you will use it in Machine Learning pipeline. This kind of transformation is better than rlog for ML. You can find some sources below:
+
+-[vst vs variance stabilizing transformation](https://www.biostars.org/p/459013/)
+-[about data transformation and DESeq2](https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#data-transformations-and-visualization)
+
+**Note on VST
+There are three types of fits for the vst transformation. We will fit every estimator and then we will see if data clusterize and compare their silhouette.
+
+```{r vst transformation Example}
+# 01 ----
+dds <- makeExampleDESeqDataSet(m=6)
+vsd <- varianceStabilizingTransformation(dds)
+dists <- dist(t(assay(vsd)))
+plot(hclust(dists))
+
+# inspect how a dds matrix should be built
+assay(dds)
+```
+
+```{r vst transformation function with test}
+# 02 Creaating a function for the transformations ----
+test_genes = unique(count.list$hc_lcf_counts$Geneid)[1:50]
+test       = count.list$hc_lcf_counts %>%  dplyr::filter(Geneid %in% test_genes) 
+
+# Make a function
+vst_transformer <- function(data, gene, id, counts, group_name, fit_types) {
+  
+  vars = c(id,gene,counts)
+  
+  print("Pivoting from long format")
+  df = data %>%
+    dplyr::select(all_of(vars)) %>%
+    pivot_wider(names_from = vars[1], values_from = vars[3]) %>%
+    column_to_rownames(var = vars[2]) %>%
+    as.matrix()
+  
+  print("Pivoting from long format completed: Initializing storage objects")
+  storage = vector(mode = "list", length = length(fit_types))
+  labels  = paste(paste(group_name, paste("vst", fit_types, sep = "_"), sep = "_"), "counts", sep = "_")
+  names(storage) = labels
+  
+  print("Storage object initialized: Starting the vst loop")
+  for (i in 1:length(fit_types)) {
+    print(paste("Starting VST type:", i))
+    storage[[i]] = varianceStabilizingTransformation(object  = df,
+                                                     blind   = TRUE,
+                                                     fitType = fit_types[i]) %>%
+      as.data.frame.matrix() %>% 
+      rownames_to_column(var = gene)
+  }
+
+  return(storage)
+}
+
+# 2.45 sec elapsed for 50 genes and 188 subjects
+tictoc::tic()
+test_list = vst_transformer(test, gene = "Geneid", id = "PATNO", counts = "Count", group_name = "hc_lcf", fit_types = config$file_05$fit_types)
+tictoc::toc()
+
+# ---------------------------END oF TESTING-------------------------------------------#
+
+# 03 Fit the transformer ----
+vst.count.list = vector(mode = "list", length = length(count.list))
+
+for (i in 1:length(count.list)) {
+  print(paste("Starting: ", i))
+  vst.count.list[[i]] =  vst_transformer(data       = count.list[[i]], 
+                                         gene       = "Geneid",
+                                         id         = "PATNO",
+                                         counts     = "Count",
+                                         group_name = config$file_05$group_names[i], 
+                                         fit_types  = config$file_05$fit_types)
+}
+
+names(vst.count.list) = config$file_05$vst.count.list.names
+
+# 03 Exports vst ----
+for (i in 1:length(vst.count.list)) {
+  for (ii in 1:length(vst.count.list[[i]])) {
+    print(paste("Exporting:", names(vst.count.list[[i]])[[ii]]))
+    
+    write.fst(x        = vst.count.list[[i]][[ii]],
+              path     = file.path(vst.out, paste0(names(vst.count.list[[i]])[[ii]],".fst")),
+              compress = 100)
+  }
+}
+```
+
+```{r vst ff}
+# 04 Create a vst + feature filter (ff) by MAD transformation ----
+vst.ff.count.list = vst.count.list
+vst.ff.stats.list = vst.count.list
+
+for (i in 1:length(vst.count.list)) {
+  for (ii in 1:length(vst.count.list[[i]])) {
+    print(paste(i, ii))
+    value = featurefilter(mydata     = vst.count.list[[i]][[ii]] %>% column_to_rownames("Geneid"),
+                          percentile = 10,
+                          method     = config$file_05$featurefilter,
+                          topN       = 20)
+    
+    vst.ff.count.list[[i]][[ii]] = value[[1]] %>% rownames_to_column("Geneid") %>% relocate(Geneid, .before = everything())
+    vst.ff.stats.list[[i]][[ii]] = value[[2]] %>%
+      rownames_to_column("Geneid") %>% 
+      relocate(Geneid, .before = everything()) %>%
+      dplyr::select(-feature)
+    
+      names(vst.ff.count.list[[i]])[[ii]] = names(vst.ff.count.list[[i]])[[ii]] %>% 
+      str_replace_all(pattern = "_counts", replacement = "_ff_counts")
+  }
+}
+
+# 04 Exports vst + ff ----
+for (i in 1:length(vst.ff.count.list)) {
+  for (ii in 1:length(vst.ff.count.list[[i]])) {
+    print(paste("Exporting:", names(vst.ff.count.list[[i]])[[ii]]))
+    
+    write.fst(x        = vst.ff.count.list[[i]][[ii]],
+              path     = file.path(vst.ff.out, paste0(names(vst.ff.count.list[[i]])[[ii]],".fst")),
+              compress = 100)
+  }
+}
+
+saveRDS(vst.ff.stats.list, file = file.path(vst.ff.stats.out, "Feature Filtering stats.rds"))
+```
+
+
+```{r vst center scale}
+# 05 Create a vst + center and scaling transformation ----
+vst.centerscale.list = vst.count.list
+
+for (i in 1:length(vst.centerscale.list)) {
+  for (ii in 1:length(vst.centerscale.list[[i]])) {
+    print(names(vst.centerscale.list[[i]])[ii])
+    
+    vst.centerscale.list[[i]][[ii]] = vst.centerscale.list[[i]][[ii]] %>%
+      pivot_longer(cols       = !Geneid,
+                   names_to   = "PATNO",
+                   values_to  = "Count") %>% 
+      pivot_wider(names_from  = "Geneid",
+                  values_from = "Count") %>% 
+      column_to_rownames("PATNO") %>%
+      as.matrix() %>%
+      scale(center = T, scale = T) %>% 
+      as.data.frame.matrix() %>% 
+      rownames_to_column("PATNO")
+    
+    names(vst.centerscale.list[[i]])[[ii]] = names(vst.centerscale.list[[i]])[[ii]] %>% 
+      str_replace_all(pattern = "_counts", replacement = "_centerscale_counts")
+  }
+}
+
+# 11 Exports vst + center/scaling ----
+for (i in 1:length(vst.centerscale.list)) {
+  for (ii in 1:length(vst.centerscale.list[[i]])) {
+    print(paste("Exporting:", names(vst.centerscale.list[[i]])[[ii]]))
+    
+    write.fst(x        = vst.centerscale.list[[i]][[ii]],
+              path     = file.path(vst.out, paste0(names(vst.centerscale.list[[i]])[[ii]],".fst")),
+              compress = 100)
+  }
+}
+```
+
+```{r vst ff cs}
+# 06 Create a vst + ff + center and scaling transformation ----
+vst.ff.centerscale.list = vst.ff.count.list
+
+for (i in 1:length(vst.ff.centerscale.list)) {
+  for (ii in 1:length(vst.ff.centerscale.list[[i]])) {
+    print(names(vst.ff.centerscale.list[[i]])[ii])
+    
+    vst.ff.centerscale.list[[i]][[ii]] = vst.ff.centerscale.list[[i]][[ii]] %>%
+      pivot_longer(cols       = !Geneid,
+                   names_to   = "PATNO",
+                   values_to  = "Count") %>% 
+      pivot_wider(names_from  = "Geneid",
+                  values_from = "Count") %>% 
+      column_to_rownames("PATNO") %>%
+      as.matrix() %>%
+      scale(center = T, scale = T) %>% 
+      as.data.frame.matrix() %>% 
+      rownames_to_column("PATNO")
+    
+    names(vst.ff.centerscale.list[[i]])[[ii]] = names(vst.ff.centerscale.list[[i]])[[ii]] %>% 
+      str_replace_all(pattern = "_counts", replacement = "_centerscale_counts")
+  }
+}
+
+# 08 Exports vst + ff + center/scaling ----
+for (i in 1:length(vst.ff.centerscale.list)) {
+  for (ii in 1:length(vst.ff.centerscale.list[[i]])) {
+    print(paste("Exporting:", names(vst.ff.centerscale.list[[i]])[[ii]]))
+    
+    write.fst(x        = vst.ff.centerscale.list[[i]][[ii]],
+              path     = file.path(vst.ff.out, paste0(names(vst.ff.centerscale.list[[i]])[[ii]],".fst")),
+              compress = 100)
+  }
+}
+```

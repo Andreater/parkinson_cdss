@@ -1,0 +1,659 @@
+---
+title: "Untitled"
+author: "Andrea Termine"
+date: '2022-07-22'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../config/config r.yaml", eval.expr=TRUE)
+
+# Paths
+data.path       = file.path(config$exp$parent, config$file_05$datapath)
+rna.meta.path   = file.path(config$exp$parent, config$file_05$rna_meta_dir)
+lcf.out         = config$file_05$lcf.out
+udf.path        = file.path(config$exp$parent, config$file_05$udf_dir)
+vst.out         = config$file_05$vst.out
+vst.ff.out      = config$file_05$vst.ff.out
+randomdf_path   = config$clustering$random_df
+ctend.out       = config$clustering$ctend.out
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(file.path(udf.path, "functions.r"))
+
+## Required Packages
+pkg = c("tidyverse", "yaml", "fst",
+        "hopkins", "FactoMineR", "factoextra",
+        "M3C", "patchwork", "seriation", "pheatmap",
+        "openxlsx")
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+```{r import}
+# import metadata ----
+rna_seq_metadata = readRDS(file.path(rna.meta.path, config$file_05$rna_meta_name))
+
+# storage for every type of counts ----
+count.list        = vector(mode = "list", length = length(config$clustering$prep_methods))
+names(count.list) = config$clustering$prep_methods
+
+# define an import function ----
+count_importer <- function(path, pattern) {
+  count.path        = list.files(path = path, pattern = pattern, full.names = T)
+  count.list        = vector(mode = "list", length = length(count.path))
+  names(count.list) = list.files(path = path, pattern = pattern, full.names = F) %>% str_remove(".fst")
+  
+  for (i in 1:length(count.path)) {
+    count.list[[i]] = read_fst(path = count.path[i])
+  }
+  
+  return(count.list)
+}
+
+# set vectors for paths and pattern ----
+paths    = c(lcf.out, vst.out, vst.out, vst.ff.out, vst.ff.out)
+patterns = c(".fst", "local_counts|mean_counts|parametric_counts", "center",
+             "local_ff_counts|mean_ff_counts|parametric_ff_counts", "center")
+
+# Import the counts ----
+for (i in 1:length(config$clustering$prep_methods)) {
+  count.list[[config$clustering$prep_methods[[i]] ]] = count_importer(path    = paths[i], 
+                                                                      pattern = patterns[i])
+}
+
+# Import the random df ----
+rdf = read.csv(file = file.path(randomdf_path, "random df.csv"))
+```
+
+# Aim
+
+## Reshape count.list
+
+LCF, LCF + vst and LCF + VST + FF data needs to be reshaped in a {samples,  genes} array.
+
+```{r reshape}
+# Reshape LCF ----
+for (i in 1:length(count.list$lcf)) {
+  count.list$lcf[[i]] =  count.list$lcf[[i]] %>% 
+    dplyr::select(PATNO, Geneid, Count) %>% 
+    pivot_wider(names_from  = "Geneid",
+                values_from = "Count")
+}
+
+# Reshape LCF + vst ----
+for (i in 1:length(count.list$lcf_vst)) {
+  count.list$lcf_vst[[i]] = count.list$lcf_vst[[i]] %>% 
+    pivot_longer(cols = !Geneid,
+                 names_to = "PATNO",
+                 values_to = "Counts") %>% 
+    pivot_wider(names_from = "Geneid",
+                values_from = "Counts")
+}
+
+# Reshape LCF + vst + FF ----
+for (i in 1:length(count.list$lcf_vst_ff)) {
+  count.list$lcf_vst_ff[[i]] = count.list$lcf_vst_ff[[i]] %>% 
+    pivot_longer(cols = !Geneid,
+                 names_to = "PATNO",
+                 values_to = "Counts") %>% 
+    pivot_wider(names_from = "Geneid",
+                values_from = "Counts")
+}
+```
+
+## Assess cluster tendency
+
+Since clustering algorithms will always find clusters, it is a good idea to check if those clusters really exists in the data. When you don't have a ground truth you can't use the external validation metrics. You can try some test to see if the distance between points in the data space is not regularly spaced (ungrouped) or randomly spaced (random). In this case you're searching for overdispersed observations constituting groups of individuals (Aggregated data). This is what the Hopkins Test does, and some other methods like VAT and IVAT are traditional methods of checking clustering tendencies.
+
+- Traditional Approaches [V]
+- M3C                    [V]
+
+### Traditional approaches
+
+Cluster tendency methods such as Hopkins, VAT and IVAT do not work good with high dimensional dataset (STHDA). But they work good with small sets. **Hopkins test** fill fail with more than 1000 columns, but can be interpreted using these guidelines: calculated values 0-0.3 indicate regularly-spaced data. Values around 0.5 indicate random data. Values 0.7-1 indicate clustered data. Regularly spaced data are ungrouped data, but not spatially random organized data. They occupy the data space equally. This was said by Hopkins in 50-60s' and now it is a bit controversial. Some say that non spherical cluster may be not properly evaluated.
+
+Since Hopkins test doesn't work good with high dimensional data we will try with our feature filtered datasets.But it **failed** as usually happens when you give him too much columns. here we used n = 15 to follow the example, the suggested number is between 15 and 20 and in general nrow must be >= 100.
+
+```{r hopkins}
+hopkins.df = data.frame(data    = character(),
+                        type    = character(),
+                        hopkins = double(),
+                        p.value = double())
+
+# An example of an high clusterable dataset
+set.seed(12345)
+h  = hopkins(iris[, -5], m=15)
+hp = hopkins.pval(h, n = 15)
+
+hopkins.df = hopkins.df %>% 
+  add_row(data    = "iris",
+          type    = "highly clusterable",
+          hopkins = h,
+          p.value = hp)
+
+# An example of a random dataset
+set.seed(12345)
+h  = hopkins(rdf, m=15)
+hp = hopkins.pval(h, n = 15)
+
+hopkins.df = hopkins.df %>% 
+  add_row(data    = "random",
+          type    = "random",
+          hopkins = h,
+          p.value = hp)
+
+# Working on our feature filtered dataset
+for (i in 1:length(count.list$lcf_vst_ff)) {
+  
+  set.seed(12345)
+  h  = count.list$lcf_vst_ff[[i]] %>% 
+    column_to_rownames("PATNO") %>% 
+    hopkins(X = ., 
+            m = 15)
+  
+  if (is.nan(h) == FALSE) {
+    hp = hopkins.pval(h, n = 15)
+  } else {
+    hp = NA
+  }
+  
+  hopkins.df = hopkins.df %>% 
+    add_row(data    = "lcf_vst_ff",
+            type    = names(count.list$lcf_vst_ff)[[i]],
+            hopkins = h,
+            p.value = hp)
+}
+
+saveRDS(hopkins.df, file = file.path(ctend.out, config$clustering$hopkins.out, "hopkins results.rds"))
+```
+
+####  VAT
+
+The algorithm of the visual assessment of cluster tendency (VAT) approach (Bezdekand Hathaway, 2002) computes the dissimilarity (DM) matrix between the objects in the data set using the **Euclidean** distance measure. Then it reorder the DM so that similar objects are close to one another. This
+process create an ordered dissimilarity matrix (ODM) 3. The ODM is displayed as an ordered dissimilarity image (ODI), which is the visual output of VAT.
+
+As we can see From the example plot, A is an highly clusterable data, while B has randomly presented observation.
+
+```{r VAT, fig.height= 8, fig.width=20}
+example.list         = list(iris = iris[-5], rdf = rdf)
+example.vat.list     = vector(mode = "list", length = length(example.list))
+names(example.vat.list) = names(example.list)
+
+for (i in 1:length(example.list)) {
+  # Here we use get_dist but we could also use dist()
+  res.dist = get_dist(x      = example.list[[i]], 
+                      stand  = TRUE,
+                      method = "euclidean")
+  example.vat.list[[i]] = fviz_dist(res.dist, gradient = list(low = "#00AFBB", mid = "white", high = "#FC4E07"))
+}
+
+example.vat.list$iris + example.vat.list$rdf + plot_layout(ncol = 2) + plot_annotation(tag_levels = "A")
+```
+
+with VAT seems that **something may be on**. The feature filtered dataset seems a little better than the others. Here we started with euclidean measure, but we could use some others. The behavior is controlled by *VAT_method parameter* in config.
+
+```{r VAT on our data}
+count.vat.dist.list        = vector(mode = "list", length = length(count.list))
+names(count.vat.dist.list) = names(count.list)
+
+count.vat.plot.list        = vector(mode = "list", length = length(count.list))
+names(count.vat.plot.list) = names(count.list)
+
+for (i in 1:length(count.list)) {
+  for (ii in 1:length(count.list[[i]])) {
+    # Onboarding
+    print(paste(i, ii))
+    
+    # Start the computations
+    prep_step = names(count.list)[[i]]
+    
+    if (str_detect(prep_step, "cs")) {
+      print("CS Detected")
+      count.vat.dist.list[[i]][[ii]] = get_dist(x      = count.list[[i]][[ii]] %>% column_to_rownames("PATNO"), 
+                                                stand  = FALSE,
+                                                method = config$clustering$VAT_method)
+      print("Dist computed")
+      count.vat.plot.list[[i]][[ii]] = fviz_dist(count.vat.dist.list[[i]][[ii]],
+                                                 gradient = list(low = "#00AFBB",
+                                                                 mid = "white",
+                                                                 high = "#FC4E07"))
+      print("Plot Saved")
+    } else {
+      print("Not CS")
+      count.vat.dist.list[[i]][[ii]] = get_dist(x      = count.list[[i]][[ii]]%>% column_to_rownames("PATNO"), 
+                                                stand  = TRUE,
+                                                method = config$clustering$VAT_method)
+       print("Dist computed")
+      count.vat.plot.list[[i]][[ii]] = fviz_dist(count.vat.dist.list[[i]][[ii]],
+                                                 gradient = list(low = "#00AFBB",
+                                                                 mid = "white",
+                                                                 high = "#FC4E07"))
+      print("Plot Saved")
+    }
+    
+    names(count.vat.dist.list[[i]])[[ii]] = names(count.list[[i]])[[ii]]
+    names(count.vat.plot.list[[i]])[[ii]] = names(count.list[[i]])[[ii]]
+    
+    dir.create(file.path(ctend.out, config$clustering$VAT_method))
+    
+    ggsave(filename = file.path(ctend.out, config$clustering$VAT_out, config$clustering$VAT_method,
+                                paste0(names(count.vat.plot.list[[i]])[[ii]], ".png")),
+           plot     = count.vat.plot.list[[i]][[ii]],
+           units    = "cm",
+           dpi      = 300,
+           width    = 26,
+           height   = 24, 
+           device   = "png")
+  }
+}
+
+save(count.vat.dist.list, count.vat.plot.list, file = file.path(ctend.out, "VAT distance matrices and plots.rdata"))
+```
+
+#### IVAT 
+
+IVAT is an improved version of VAT. It is implemented with seriation, along with dissplots and hmaps. Since IVAT is slower than VAT we will perform this analysis only on feature filtered features.
+
+```{r IVAT example}
+# Example: lines data set from Havens and Bezdek (2011) 
+x = create_lines_data(250)
+plot(x, xlim=c(-5,5), ylim=c(-3,3), cex=.2)
+d = dist(x)
+
+# Example with the random dataset
+r_dist = dist(rdf)
+
+## create regular VAT
+VAT(d, main = "VAT for Lines")
+ggiVAT(d) + labs(title = "IVAT for Lines") + ggiVAT(r_dist) + labs(title = "IVAT for random df")
+
+## compare with dissplot (shows banded structures and relationship between
+## center line and the two outer lines)
+dissplot(d, method = "OLO_single", main = "Dissplot for Lines clusterable", col = bluered(100, bias = .5))
+dissplot(r_dist, method = "OLO_single", main = "Dissplot for Lines random", col = bluered(100, bias = .5))
+
+## compare with optimally reordered heatmap
+hmap(d, method = "OLO_single", main = "Heatmap for Lines (opt. leaf ordering)", col = bluered(100, bias = .5))
+hmap(r_dist, method = "OLO_single", main = "Heatmap for random (opt. leaf ordering)", col = bluered(100, bias = .5))
+```
+
+IVAT gave **strong results** in favour of PD clustering but not HC clustering. We could also create heatmaps in seriation.
+
+```{r IVAT RUN ON PPMI VST FF CS}
+count.ivat.plot.list = vector(mode = "list", length = length(count.list$lcf_vst_ff_cs))
+names(count.ivat.plot.list) = names(count.list$lcf_vst_ff_cs)
+count.ivat.dist.list = count.ivat.plot.list
+
+for (i in 1:length(count.list$lcf_vst_ff_cs)) {
+  print(i)
+  dist = dist(x = count.list$lcf_vst_ff_cs[[i]], method  = config$clustering$IVAT_method)
+  plt  = ggiVAT(dist) + labs(title = names(count.ivat.plot.list)[i])
+  
+  ggsave(filename = file.path(ctend.out,config$clustering$IVAT_out, paste0(names(count.ivat.plot.list)[i], ".png")),
+         plot     = plt,
+         units    = "cm",
+         dpi      = 300,
+         width    = 26,
+         height   = 24, 
+         device   = "png")
+  
+  count.ivat.dist.list[[i]] = dist
+  
+  # This is an old plot method that doesn't use ggplot
+  # png(filename = file.path(ctend.out, config$clustering$IVAT_out, config$clustering$diss_out, paste0(names(count.ivat.plot.list)[i], "_diss.png")))
+  # dissplot(dist, method = config$clustering$IVAT_dissimilarity_method, main = names(count.ivat.plot.list)[i], col = reds(100, bias = .5))
+  # dev.off()
+  
+  plt_diss = ggdissplot(dist, method = config$clustering$IVAT_dissimilarity_method)
+  
+  ggsave(filename = file.path(ctend.out, config$clustering$IVAT_out, config$clustering$diss_out,
+                              paste0(names(count.ivat.plot.list)[i], "_diss.png")),
+         plot     = plt_diss,
+         units    = "cm",
+         dpi      = 300,
+         width    = 26,
+         height   = 24, 
+         device   = "png")
+}
+
+# Vat and IVAT exports
+save(count.ivat.dist.list, count.ivat.plot.list, file = file.path(ctend.out, "IVAT distance matrices and plots.rdata"))
+```
+
+Learn more on seriation [here](https://cran.r-project.org/web/packages/seriation/vignettes/seriation.pdf)
+
+### Correlation based Heatmap
+
+We could use heatmap in seriation or in pheatmap for every type of dist matrix, but the factoextra solution is faster so we will use it. Correlation based heatmaps are commonly used for gene expression and help to identify samples with similar patterns of expression.
+
+```{r corr on example}
+# Example on iris highly clust
+dist = get_dist(x = iris[-5], method = "pearson")
+
+plt_iris = fviz_dist(dist,
+                     order       = TRUE,
+                     show_labels = F,
+                     lab_size    = NULL,
+                     gradient    = list(low = "red", mid = "white", high = "blue"))
+
+# Example on random df
+dist = get_dist(x = rdf, method = "pearson")
+
+plt_rdf = fviz_dist(dist,
+                    order       = TRUE,
+                    show_labels = F,
+                    lab_size    = NULL,
+                    gradient    = list(low = "red", mid = "white", high = "blue"))
+
+plt_iris + plt_rdf + plot_layout(ncol = 2) + plot_annotation(tag_levels = "A")
+```
+
+Let's replicate on our data. We will work on feature filtered data since they are the most promising.
+
+```{r corr on vst + ff + cs}
+count.correlation.dist.list        = rec.list(len = c(length(config$clustering$correlation_methods), length(count.list$lcf_vst_ff_cs)))
+names(count.correlation.dist.list) = config$clustering$correlation_methods
+count.correlation.plot.list        = count.correlation.dist.list
+
+for (i in 1:length(config$clustering$correlation_methods)) {
+  for (ii in 1:length(count.list$lcf_vst_ff_cs)) {
+    print(paste(i, ii))
+    print("directory check")
+    dir_pam  = dir.exists(path = file.path(ctend.out, config$clustering$corr.out, config$clustering$correlation_methods[i]))
+    
+    if (dir_pam == FALSE) {
+      print("creating directory")
+      dir.create(path = file.path(ctend.out, config$clustering$corr.out, config$clustering$correlation_methods[i]))
+    }
+    
+    print("Computing distance")
+    count.correlation.dist.list[[i]][[ii]] = get_dist(x      = count.list$lcf_vst_ff_cs[[ii]][-1],
+                                                      method = )
+    names(count.correlation.dist.list[[i]])[ii] = names(count.list$lcf_vst_ff_cs)[ii]
+    
+    print("Plotting")
+    count.correlation.plot.list[[i]][[ii]] = fviz_dist(count.correlation.dist.list[[i]][[ii]],
+                                                       order       = TRUE,
+                                                       show_labels = F,
+                                                       lab_size    = NULL,
+                                                       gradient    = list(low = "red", mid = "white", high = "blue"))
+    names(count.correlation.plot.list[[i]])[ii] = names(count.list$lcf_vst_ff_cs)[ii]
+    
+    print("Exporting")
+    ggsave(filename = file.path(ctend.out, config$clustering$corr.out, config$clustering$correlation_methods[[i]], 
+                                paste0(names(count.correlation.plot.list[[i]])[ii], ".png")),
+           plot     = count.correlation.plot.list[[i]][[ii]],
+           units    = "cm",
+           dpi      = 300,
+           width    = 26,
+           height   = 24, 
+           device   = "png")
+  }
+}
+
+save(count.correlation.dist.list, count.correlation.plot.list, file = file.path(ctend.out, "correlation distance matrices and plot.rdata"))
+```
+
+Results were indeed positive, it seems a bit less sensitive than the previous. I think that this method of visualization is not working extremely good when you include a lot of features that do not contain signal.
+
+### M3C
+
+
+Monte Carlo Reference-based Consensus Clustering (M3C) can be used to stratify patients for precision medicine based on genome wide expression data. It requires that data were normalized and feature filtered prior to fitting the test. **Here we need to arrange samples a columns and rows as features to obtain a {feature, sample} array.**
+
+M3C requires that you check outliers first. The preprocessing including lcf, vst, ff and cs is necessary to run M3C.
+
+```{r anomaly detection M3C}
+data = count.list$lcf_vst_ff_cs[[6]] %>% 
+  pivot_longer(contains("G0"),
+               names_to  = "gene",
+               values_to = "count") %>% 
+  pivot_wider(names_from  = "PATNO",
+              values_from = "count") %>% 
+  column_to_rownames("gene")
+
+pca = pca(data, text = names(data), scaler = FALSE)
+pca
+```
+
+The M3C function has an undocumented parameter (method) which allows to switch between Monte Carlo simulation and Regularised consensus clustering.You can see this in the vignette. Here we are testing every combination of methods. **Note that we added a patno_ prefix to the sample names because the function fails without it.It can't take numerical strings as columns name. We have to remove the prefix later.**
+
+About the **"chol"** reference method:
+
+Chol stands for Cholesky decomposition and it is a method of matrix decomposition used in the Montecarlo sampling to solve multiple linear equation simulating intercorrelated variables. It is also used here when n samples > n features.
+
+```{r M3C method 1 Montecarlo}
+m3c.montecarlo.list = rec.list(len = c(length(config$clustering$M3C_obj_fun),
+                                       length(config$clustering$M3C_alg), 
+                                       length(config$clustering$M3C_ref_meth)))
+names(m3c.montecarlo.list) = config$clustering$M3C_obj_fun
+
+for (i in 1:length(m3c.montecarlo.list)) {
+  for (ii in 1:length(m3c.montecarlo.list[[i]])) {
+    for (iii in 1:length(m3c.montecarlo.list[[i]][[ii]])) {
+      for (iv in 1:length(count.list$lcf_vst_ff_cs)) {
+        
+        cat(paste("Executing df:", paste0(iv,"\n"),
+                  "obj_func:", config$clustering$M3C_obj_fun[i],"\n",
+                  "algorithm:", config$clustering$M3C_alg[ii],"\n",
+                  "ref_method:", config$clustering$M3C_ref_meth[iii], "\n"))
+        
+        names(m3c.montecarlo.list[[i]])[ii]              = config$clustering$M3C_alg[ii]
+        names(m3c.montecarlo.list[[i]][[ii]])[iii]       = config$clustering$M3C_ref_meth[iii]
+        
+        data = count.list$lcf_vst_ff_cs[[iv]] %>% 
+          pivot_longer(cols = contains("G0"),
+                       names_to = "gene",
+                       values_to = "count") %>% 
+          pivot_wider(names_from = "PATNO",
+                      values_from="count") %>% 
+          column_to_rownames("gene") %>%
+          `colnames<-`(paste0("patno_",names(.)))
+        
+        m3c.montecarlo.list[[i]][[ii]][[iii]][[iv]] = M3C(mydata        = data,
+                                                          cores         = config$default$cores,
+                                                          method        = 1,
+                                                          iters         = 25,
+                                                          maxK          = 10,
+                                                          pItem         = 0.8,
+                                                          des           = NULL,
+                                                          ref_method    = config$clustering$M3C_ref_meth[iii],
+                                                          repsref       = 100,
+                                                          repsreal      = 100,
+                                                          clusteralg    = config$clustering$M3C_alg[ii],
+                                                          pacx1         = 0.1,
+                                                          pacx2         = 0.9,
+                                                          seed          = 12345,
+                                                          objective     = config$clustering$M3C_obj_fun[i],
+                                                          removeplots   = FALSE,
+                                                          silent        = FALSE,
+                                                          fsize         = 18,
+                                                          lambdadefault = 0.1,
+                                                          tunelambda    = TRUE,
+                                                          lseq          = seq(0.02, 0.1, by ,0.02),
+                                                          lthick        = 2,
+                                                          dotsize       = 3)
+        
+        names(m3c.montecarlo.list[[i]][[ii]][[iii]])[iv] = names(count.list$lcf_vst_ff_cs)[iv]
+        
+      }
+    }
+  }
+}
+# Export m3c for the archives
+for (i in 1:length(m3c.montecarlo.list)) {
+  for (ii in 1:length(m3c.montecarlo.list[[i]])) {
+    for (iii in 1:length(m3c.montecarlo.list[[i]][[ii]])) {
+      for (iv in 1:length(count.list$lcf_vst_ff_cs)) {
+               
+        cat(paste("Executing df:", paste0(iv,"\n"),
+                  "obj_func:", config$clustering$M3C_obj_fun[i],"\n",
+                  "algorithm:", config$clustering$M3C_alg[ii],"\n",
+                  "ref_method:", config$clustering$M3C_ref_meth[iii], "\n"))
+        
+        exp.path = file.path(ctend.out,
+                             config$clustering$M3C.out,
+                             config$clustering$M3C_obj_fun[i],
+                             config$clustering$M3C_alg[ii],
+                             config$clustering$M3C_ref_meth[iii])
+        
+        if (dir.exists(exp.path) == FALSE) {
+          dir.create(exp.path, recursive = TRUE)
+        }
+
+        saveRDS(m3c.montecarlo.list[[i]][[ii]][[iii]][[iv]],
+                file = file.path(exp.path,
+                                 paste0(names(m3c.montecarlo.list[[i]][[ii]][[iii]])[iv],".rds")))
+        
+      }
+    }
+  }
+}
+
+nlength = length(count.list$lcf_vst_ff_cs) * (length(config$clustering$M3C_obj_fun) *
+                                                length(config$clustering$M3C_alg) *
+                                                length(config$clustering$M3C_ref_meth))
+
+m3c.montecarlo.res = vector(mode = "list", length = nlength)
+
+# Obtain a dataframe
+v = 1
+for (i in 1:length(m3c.montecarlo.list)) {
+  for (ii in 1:length(m3c.montecarlo.list[[i]])) {
+    for (iii in 1:length(m3c.montecarlo.list[[i]][[ii]])) {
+      for (iv in 1:length(count.list$lcf_vst_ff_cs)) {
+          
+          m3c.montecarlo.res[[v]] = m3c.montecarlo.list[[i]][[ii]][[iii]][[iv]][["scores"]] %>% 
+            mutate(method     = "Monte Carlo simulation",
+                   dataset    = names(m3c.montecarlo.list[[i]][[ii]][[iii]])[iv],
+                   obj_fun    = config$clustering$M3C_obj_fun[i],
+                   algorithm  = config$clustering$M3C_alg[ii],
+                   ref_method = config$clustering$M3C_ref_meth[iii]) %>% 
+            relocate(method, dataset, obj_fun, algorithm, ref_method, .before = everything())
+          
+        v = v+1
+        }
+      }
+    }
+  }
+
+m3c.montecarlo.res = m3c.montecarlo.res %>% reduce(bind_rows)
+
+saveRDS(m3c.montecarlo.res, file = file.path(ctend.out,  config$clustering$M3C.out, "results list.rds"))
+```
+
+##### How to interpret M3C
+
+Interpreting M3C can be difficult. The first question is how can I interpret the p.value in the method 1? It depends by the objective function that you have used. In the above example, we can reject the null hypothesis that k = 1 when the scores from the **entropy** examples report a norm_p below 0.05. In the **PAC** example you don't have a norm_p and therefore you should use the higher RCSI and P_score.The p_ score is only the log10 version of the beta P value with the same null hypothesis. **So in the end only the RCSI matters**. But what is an RCSI?
+
+The RCSI is the relative cluster stability index that allows to correct PAC values biased by the high number of resamples in montecarlo. 
+
+```{r examples for interpretation}
+example = M3C(mydata        = M3C::mydata,
+              cores         = config$default$cores,
+              objective     = "entropy")
+
+example$scores
+
+example2 = M3C(mydata        = M3C::mydata,
+              cores         = config$default$cores,
+              objective     = "PAC")
+
+example2$scores
+```
+
+Ok so now we will inspect the result. The first step is to separate the dataframe based on objective function.Then we will create the variable cohort.
+We can check the **highest RCSI per cohort** and identify which k is more stable and significantly better than k = 1. This is the **best out of 96 method.*
+
+The first element you could use is to sum how many times k was significant with **max RCSI for each cohort, algorithm and ref method**. This is the majority method and tells you how many clusters are more likely. 
+
+```{r Actual interpretation}
+m3c.montecarlo.res.list = m3c.montecarlo.res %>% split(f= .$obj_fun)
+m3c.montecarlo.res.list = lapply(m3c.montecarlo.res.list, function(x) { x %>%
+                                                                        dplyr::select(-all_of(nacolumns(x))) %>% 
+                                                                        mutate(cohort   = word(dataset, start = 1, sep = "_")) %>% 
+                                                                        relocate(cohort, .before = everything())})
+m3c.montecarlo.res.list$entropy =
+m3c.montecarlo.res.list$entropy %>% 
+  mutate(p_signif = ifelse(NORM_P < 0.05, "yes", "no"))
+
+m3c.montecarlo.res.list$PAC =
+m3c.montecarlo.res.list$PAC %>% 
+  mutate(p_signif = ifelse(BETA_P < 0.05, "yes", "no"))
+
+### highest RCSI per cohort method ----
+list(entropy =  m3c.montecarlo.res.list$entropy %>% 
+       group_by(cohort) %>% 
+       filter(RCSI == max(RCSI)),
+     pac =  m3c.montecarlo.res.list$PAC %>% 
+  group_by(cohort) %>% 
+  filter(RCSI == max(RCSI))) %>% 
+  write.xlsx(file.path(ctend.out, config$clustering$M3C.out, "summary of M3c with highest RCSI method.xlsx"))
+
+ 
+ 
+
+### Majority criteria ----
+m3c.montecarlo.res.plot = vector(mode = "list", length = length(config$clustering$M3C_obj_fun))
+names(m3c.montecarlo.res.plot) = config$clustering$M3C_obj_fun
+
+for (i in 1:length(m3c.montecarlo.res.plot)) {
+  m3c.montecarlo.res.plot[[i]] =  m3c.montecarlo.res.list[[i]] %>% 
+    group_by(cohort, algorithm, ref_method) %>% 
+    filter(RCSI == max(RCSI)) %>% 
+    arrange(desc(RCSI)) %>% 
+    ungroup() %>% 
+    group_by(cohort, K) %>% 
+    tally() %>% 
+    ggplot() +
+    aes(x = as.character(K),
+        y = n/sum(n)*100) +
+    geom_col() +
+    facet_grid(~cohort, scales = "free") + 
+    labs(y =  "count(%)",
+         x = "K")
+}
+
+for (i in 1:length(m3c.montecarlo.res.plot)) {
+m3c.montecarlo.res.list[[i]] %>% 
+    group_by(cohort, algorithm, ref_method) %>% 
+    filter(RCSI == max(RCSI)) %>% 
+    arrange(desc(RCSI)) %>% 
+    write.xlsx(file.path(ctend.out, config$clustering$M3C.out, paste(names(m3c.montecarlo.res.plot)[i],
+                                                            "max RCSI for algorithm cohort and method prior to tally.xlsx")))
+    
+}
+
+
+plt = m3c.montecarlo.res.plot[[1]] + m3c.montecarlo.res.plot[[2]] + plot_layout(ncol = 2, guides = "collect") + plot_annotation(tag_levels = "A")
+ 
+ggsave(filename = file.path(ctend.out, config$clustering$M3C.out, "max RCSI for algorithm cohort and method.png"),
+       plot     = plt,
+       units    = "cm",
+       dpi      = 300,
+       width    = 24,
+       height   = 16, 
+       device   = "png")
+
+write.xlsx(m3c.montecarlo.res.list, file = file.path(ctend.out, config$clustering$M3C.out, "results with better wrangling.xlsx"))
+plt
+```
+
+From the above plot we can see the *entropy data on left (A)* and the *PAC data on right (B)*. The best k based on stability criteria for each dataset, algorithm and reference method is obtained based on frequency data.
+
+In the next .rmd we will visualize the clusters using the label produced by M3C and dimensionality reduction.
+
