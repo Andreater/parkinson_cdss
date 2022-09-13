@@ -8,6 +8,6 @@ additionalClustering:
   dataDir: "../data/RNAseq"
   countFile: "counts.csv"
   countPath: ${additionalClustering.dataDir}/${additionalClustering.countFile}
-  labelsDir: "../data/RNAseq/clustering pipeline after m3c"
+  labelsDir: "${additionalClustering.dataDir}/clustering pipeline after m3c"
   labelsFile: "labels from bisecting kmeans.csv"
   labelsPath: ${additionalClustering.labelsDir}/${additionalClustering.labelsFile}
