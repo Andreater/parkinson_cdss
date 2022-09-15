@@ -49,4 +49,10 @@ clustering:
 
 clustering_after_m3c:
   count_path: !expr file.path(dirname(getwd()), "data", "RNAseq", "vst_ff", paste0("pd_lcf_vst_mean_ff_centerscale_counts",".fst"))
-  clres_out: "E:/ppmi/data/intermediate/exp1/RNAseq"
+  clres_out: "../data/RNAseq"
+  m3cLabels: "../data/RNAseq/clustering/m3c pd labels.xlsx"
+  intMetricsDir: "../data/RNAseq/clustering pipeline after m3c"
+  bskmeansFile: "labels from bisecting kmeans.csv"
+  inMetricsM3c: "../data/RNAseq/clustering/m3c internal metrics clustering.xlsx"
+  intMetricsFile: "summary of internal metrics of r and python algorithms compared to M3C.xlsx"
+  intMetricsPlot: "Summary plot of internal metrics.png"
