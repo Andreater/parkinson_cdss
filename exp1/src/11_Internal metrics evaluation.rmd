@@ -1,0 +1,222 @@
+---
+title: "11"
+author: "Andrea Termine"
+date: "2022-09-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../config/config r.yaml", eval.expr=TRUE)
+
+# Paths
+udf.path        = file.path(config$exp$parent, config$file_05$udf_dir)
+rna.meta.path   = file.path(config$exp$parent, config$file_05$rna_meta_dir)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(file.path(udf.path, config$file_05$udf_name))
+
+## Required Packages
+pkg = c("tidyverse", "yaml", "fst",
+        "FactoMineR", "factoextra", "mclust",
+        "fpc", "dbscan",
+        "clusterCrit", "openxlsx", "patchwork")
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+```{r import, message=FALSE, warning=FALSE}
+# import metadata ----
+rna_seq_metadata = readRDS(file.path(rna.meta.path, config$file_05$rna_meta_name))
+
+# import counts ----
+entropy.counts = fst::read.fst(path = config$clustering_after_m3c$count_path)
+entropy.counts = entropy.counts %>% column_to_rownames("PATNO")
+
+# import clustering after m3c metrics ----
+intmetrics_names = list.files(path       = config$clustering_after_m3c$intMetricsDir,
+                              pattern    = ".xlsx",
+                              full.names = F) %>% 
+  str_replace_all(" ", "_") %>% 
+  word(start = 1, end = 3, sep = "_")
+
+intmetrics_paths = list.files(path       = config$clustering_after_m3c$intMetricsDir,
+                              pattern    = ".xlsx",
+                              full.names = T) 
+
+intmetrics = vector(mode = "list", length = length(intmetrics_paths))
+names(intmetrics) = intmetrics_names
+for (i in 1:length(intmetrics_paths)) {
+  intmetrics[[i]] = read.xlsx(intmetrics_paths[i])
+  intmetrics[[i]] = intmetrics[[i]] %>% mutate(linkage = as.character(linkage),
+                                               distance = as.character(distance))
+}
+intmetrics = intmetrics %>% reduce(bind_rows)
+
+# import m3c metrics ----
+m3cmetrics = read.xlsx(config$clustering_after_m3c$inMetricsM3c)
+m3cmetrics = m3cmetrics %>% mutate(type = "M3C",
+                                   linkage = NA_character_,
+                                   distance = NA_character_,
+                                   clustering_method = "kmeans") %>% 
+  dplyr::select(type, linkage, distance, clustering_method, method, value)
+
+# Bisecting kmeans labels ----
+bsk_labels = read.csv(file = file.path(config$clustering_after_m3c$intMetricsDir, config$clustering_after_m3c$bskmeansFile), 
+         header = F) %>%
+  rename(BSK_labels = V1) %>% 
+  mutate(BSK_labels = ifelse(BSK_labels == 0, 1, 2))
+```
+
+## Summary
+
+In this rmd we will observe how the m3c solution behaves when compared to other clustering algorithms we fitted in r and python.
+
+```{r compute bsk metrics}
+# Compute the internal validation metrics
+intCriteria = intCriteria(traj = entropy.counts %>% as.matrix,
+                          part = bsk_labels$BSK_labels %>% as.integer(),
+                          crit = c("C_index","Calinski_Harabasz","Dunn", "Silhouette", "S_Dbw"))  
+
+# Create a dataframe from the intCriteria list
+bsk_res =  data.frame(type               = "partitioning methods",
+                      linkage            = NA_character_,
+                      distance           = "euclidean",
+                      clustering_method  = "Bisecting kmeans",
+                      method             = names(intCriteria),
+                      value              = intCriteria %>% paste(sep = "") %>% as.numeric())
+
+intmetrics = rbind(intmetrics, bsk_res)
+
+# update the m3c metrics to include only the selected metrics
+m3cmetrics = m3cmetrics %>% filter(method %in% c("c_index","calinski_harabasz","dunn", "silhouette", "s_dbw"))
+
+intmetrics = rbind(intmetrics, m3cmetrics)
+# Remove S_dbw as it fails in most of the conditions
+intmetrics = intmetrics %>% 
+  filter(method != "s_dbw")
+
+write.xlsx(intmetrics, file = file.path(config$clustering_after_m3c$intMetricsDir, config$clustering_after_m3c$intMetricsFile))
+
+# Add this variable for plotting
+intmetrics = intmetrics %>% 
+  mutate(color = ifelse(type == "M3C", "Consesus clustering", NA_character_)) %>% 
+  filter(method %in% c("c_index","calinski_harabasz","dunn", "silhouette", "s_dbw"))
+
+
+```
+
+### Visualize the data
+
+All of the metrics show that the M3C solution is equal or better than other alternatives. The only exception is the silhouette metrics, but this one is not useful when you are working on sub-clusters like in our case (Liu, 2010).
+
+```{r}
+intmetrics %>% 
+  ggplot() +
+  aes(#x = type,
+      y = value,
+      fill = color) +
+  coord_flip() +
+  geom_histogram() +
+  facet_grid(~ method, scales = "free")
+
+xtabs(~ value + type, intmetrics %>%
+        filter(method == "silhouette") %>% 
+        distinct()) %>%
+  addmargins() %>%
+  broom::tidy() 
+
+pl4 = intmetrics %>% 
+  distinct() %>% 
+  ggplot() +
+  aes(y = value,
+      fill = type) +
+  geom_histogram() +
+  facet_grid(~ method, scales = "free") +
+  theme(legend.position = "bottom") +
+  coord_flip()
+  
+```
+
+### Compare the m3c and the agglomerative labeling
+
+From the comparison below we can see that two agnes and hc algorithms produced the exact same labeling for the clusters. So we can use one of them without problems. In the next step we will compare the labeling with the M3C solution.
+
+```{r}
+intmetrics %>% 
+  filter(method == "silhouette") %>% 
+  filter(value == max(value, na.rm = T)) %>% 
+  distinct()
+
+h_clust = readRDS(file = file.path(config$clustering_after_m3c$intMetricsDir,
+                                          "hierarchical or agglomerative clustering objects.rds"))  
+# The labeling is equal? if yes then true 
+sum(h_clust$hclust$complete$euclidean$cluster == h_clust$hclust$complete$minkowski$cluster) == length(h_clust$hclust$complete$euclidean$cluster)
+sum(h_clust$agnes$complete$euclidean$cluster  == h_clust$agnes$complete$minkowski$cluster) == length(h_clust$hclust$complete$euclidean$cluster)
+sum(h_clust$hclust$complete$euclidean$cluster == h_clust$agnes$complete$minkowski$cluster) == length(h_clust$hclust$complete$euclidean$cluster)
+```
+
+There are 501/570 equal labels. We should see them on a pca.
+
+```{r}
+m3c_labels = read.xlsx(config$clustering_after_m3c$m3cLabels)
+n_equals  = sum(h_clust$hclust$complete$euclidean$cluster == m3c_labels$label)
+print(paste("There are", paste0(n_equals, "/",nrow(m3c_labels)), "equal labels"))
+
+# build a df
+h_clust_labels = h_clust$hclust$complete$euclidean$cluster %>% 
+  as.data.frame() %>% 
+  rownames_to_column("PATNO") %>%
+  rename(label = ".") %>%
+  mutate(type = "hc")
+names(h_clust_labels) = c("PATNO", "label", "type")
+
+m3c_labels = m3c_labels %>% mutate(type = "m3c")
+
+labels = bind_rows(h_clust_labels, m3c_labels)
+
+labels = labels %>% 
+  pivot_wider(names_from = type,
+              values_from = label) %>% 
+  mutate(hit = ifelse(hc == m3c, "hit", "miss"),
+         index = ifelse(hc == m3c, hc, "uncertain"))
+
+# Perform the classical pca
+entropy.pca = PCA(entropy.counts, scale.unit = FALSE, graph = FALSE)
+
+pl1 = fviz_pca_ind(entropy.pca,
+             habillage = labels$index %>% as.character() %>% as.factor(),
+             label    = "none") + labs(title = "PCA showing mismatch (uncertancy) between m3c and hclust")
+
+pl2 = fviz_pca_ind(entropy.pca,
+             habillage = h_clust_labels$label %>% as.character() %>% as.factor(),
+             label    = "none") + labs(title = "PCA showing labels from hclust")
+
+pl3 = fviz_pca_ind(entropy.pca,
+             habillage = m3c_labels$label %>% as.character() %>% as.factor(),
+             label    = "none") + labs(title = "PCA showing labels from m3c")
+
+pl_tot = pl4 + pl3 + pl2 + pl1 + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+ggsave(filename = file.path(config$clustering_after_m3c$intMetricsDir, config$clustering_after_m3c$intMetricsPlot),
+       device = "png",
+       units = "cm",
+       width = 30,
+       height = 24,
+       dpi = 300)
+
+write.xlsx(labels, file = file.path(config$clustering_after_m3c$intMetricsDir, config$clustering_after_m3c$intMetricsLabel))
+```
+

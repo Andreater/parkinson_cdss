@@ -56,3 +56,4 @@ clustering_after_m3c:
   inMetricsM3c: "../data/RNAseq/clustering/m3c internal metrics clustering.xlsx"
   intMetricsFile: "summary of internal metrics of r and python algorithms compared to M3C.xlsx"
   intMetricsPlot: "Summary plot of internal metrics.png"
+  intMetricsLabel: "Labels from m3c and hclust with mismatch.xlsx"
