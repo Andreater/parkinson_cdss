@@ -11,3 +11,14 @@ additionalClustering:
   labelsDir: "${additionalClustering.dataDir}/clustering pipeline after m3c"
   labelsFile: "labels from bisecting kmeans.csv"
   labelsPath: ${additionalClustering.labelsDir}/${additionalClustering.labelsFile}
+
+randomData:
+  nSamples: 500
+  rng:
+    - 0
+    - 100
+  randomDataDir: "../data/RNAseq"
+  randomDataFile: "randomData.csv"
+  randomDataPath: "${randomData.randomDataDir}/${randomData.randomDataFile}"
+  pcaFile: "pca on no structured data.csv"
+  pcaPath: "${randomData.randomDataDir}/${randomData.pcaFile}"
