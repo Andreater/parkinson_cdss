@@ -56,6 +56,9 @@ intmetrics_paths = list.files(path       = config$clustering_after_m3c$intMetric
                               pattern    = ".xlsx",
                               full.names = T) 
 
+intmetrics_paths = intmetrics_paths[str_detect(intmetrics_paths, "results")]
+intmetrics_names = intmetrics_names[str_detect(intmetrics_names,"Labels|summary", negate = T)]
+
 intmetrics = vector(mode = "list", length = length(intmetrics_paths))
 names(intmetrics) = intmetrics_names
 for (i in 1:length(intmetrics_paths)) {
