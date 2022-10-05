@@ -39,13 +39,13 @@ clustering:
   M3C_obj_fun: !expr c("entropy", "PAC")
   M3C_ref_meth: !expr c("reverse-pca", "chol")
   M3C_out: "m3c/method1"
-  entropy_solution: "../data/RNAseq/clustering/clustering tendency results/m3c/method1/entropy/km/chol/pd_lcf_vst_mean_ff_centerscale_counts_rds"
-  pac_solution: "../data/RNAseq/clustering/clustering tendency results/m3c/method1/pac/km/chol/pd_lcf_vst_local_ff_centerscale_counts_rds"
+  entropy_solution: "../data/RNAseq/clustering/clustering tendency results/m3c/method1/entropy/km/chol/pd_lcf_vst_mean_ff_centerscale_counts.rds"
+  pac_solution: "../data/RNAseq/clustering/clustering tendency results/m3c/method1/pac/km/chol/pd_lcf_vst_local_ff_centerscale_counts.rds"
   entropy_dataset: "pd_lcf_vst_mean_ff_centerscale_counts"
   pac_dataset: "pd_lcf_vst_local_ff_centerscale_counts"
   m3c_internal_metrics: "../data/RNAseq/clustering/m3c internal metrics clustering_xlsx"
   m3c_cluster_labels: "../data/RNAseq/clustering/m3c pd labels_xlsx"
-  entropy_pca_out: "../data/RNAseq/clustering/entropy pca_rds"
+  entropy_pca_out: "../data/RNAseq/clustering/entropy pca.rds"
 
 clustering_after_m3c:
   count_path: !expr file.path(dirname(getwd()), "data", "RNAseq", "vst_ff", paste0("pd_lcf_vst_mean_ff_centerscale_counts",".fst"))
@@ -57,3 +57,15 @@ clustering_after_m3c:
   intMetricsFile: "summary of internal metrics of r and python algorithms compared to M3C.xlsx"
   intMetricsPlot: "Summary plot of internal metrics.png"
   intMetricsLabel: "Labels from m3c and hclust with mismatch.xlsx"
+
+results_presenting:
+  count_pd: "data/RNAseq/vst_ff/pd_lcf_vst_mean_ff_centerscale_counts.fst"
+  random_data: "data/RNAseq/randomData.csv"
+  random_pca: "data/RNAseq/pca on no structured data.csv"
+  nc_objects: "data/RNAseq/nc objects for plotting.rdata"
+  ivat_pd: "data/RNAseq/clustering/clustering tendency results/ivat/IVAT distance matrices and plots euclidean.rdata"
+  ivat_nc: "data/RNAseq/images/dist matrix NC.rds"
+  ivat_nc_plot: "data/RNAseq/images/ivat NC.png"
+  entropy_pca: "data/RNAseq/clustering/entropy pca.rds"
+  m3c_PD_labels: "data/RNAseq/clustering/m3c pd labels.xlsx"
+  m3c_object: "data/RNAseq/clustering/clustering tendency results/m3c/method1/entropy/km/chol/pd_lcf_vst_mean_ff_centerscale_counts.rds"
