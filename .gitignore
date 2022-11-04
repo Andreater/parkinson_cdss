@@ -1,8 +1,10 @@
 .Rproj.user
 .Rhistory
+.rds
 .RData
 .Ruserdata
 
 /data
 exp1/data/
+exp2/data/
 metadata/
