@@ -1,0 +1,297 @@
+---
+title: "Untitled"
+author: "Andrea Termine"
+date: "2022-10-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../config/config r.yaml", eval.expr=TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(config$default$udfPath)
+# source("udf.R")
+# source("wide_rm_tester_functions.R")
+## Required Packages
+pkg = config$pkg
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+## Data Import
+
+- Metadata 
+  - RNAseq          [V]
+  - Analytic Cohort [V]
+  - PD labels (M3C) [V]
+  - codebook        [V]
+  
+- Actual data
+ - Subject Characteristics [V]
+ 
+```{r Basic, warning=FALSE}
+# Metadata ----
+## rna Metadata  ----
+meta_rna      = readRDS(config$metadata$rnaMetaPath)
+## Analytic Cohort metadata ----
+meta_analytic = readRDS(config$metadata$analyticMetaPath)
+## PD Labels from M3C ----
+pd_labels     = read.xlsx(config$metadata$m3cLabelsPath)
+## Codebook for columns (3 sheets)
+codebookNames   = readxl::excel_sheets(path = config$metadata$codebook)
+codebook        = vector(mode = "list", length = length(codebookNames))
+names(codebook) = config$metadata$codebookNames
+for (i in 1:length(codebook)) {codebook[[i]] = read.xlsx(config$metadata$codebook, sheet = i)}
+
+# Actual Biomedical data ----
+## Subject characteristics 
+subject_characteristics = list(demographics   = batch_csv_import(config$subjectCharacteristics$demodir),
+                               genetic_status = batch_csv_import(config$subjectCharacteristics$geneticdir),
+                               other          = batch_csv_import(config$subjectCharacteristics$scdir))
+```
+
+## Build a core dataset
+
+This core dataset included all the PD, HC, Prodromal subject at **BL**. Each subject has a label column which contains the PD clusters labels as well as the original information about cohort and subgroup. A summary table of label was printed below.
+
+```{r}
+pd_labels = pd_labels %>% mutate(label = ifelse(label == 1, "PDC1", "PDC2"))
+meta_rna %>% dplyr::select(PATNO, GENDER, Cohort, Subgroup, CLINICAL_EVENT) %>% filter(CLINICAL_EVENT == "BL")
+ 
+core_set = left_join(meta_rna %>% mutate(PATNO = as.character(PATNO)) %>% 
+          dplyr::select(PATNO, GENDER, Cohort, Subgroup, CLINICAL_EVENT) %>% filter(CLINICAL_EVENT == "BL"),
+          pd_labels, by = "PATNO") %>% 
+  mutate(label = ifelse(is.na(label), Cohort, label)) %>% 
+  relocate(CLINICAL_EVENT, .after = label) %>% 
+  dplyr::select(- CLINICAL_EVENT)
+
+core_set$label %>% table()
+```
+
+## Data Analysis: Subject Characteristics
+
+### Demographics and other
+
+```{r Wrangling}
+# Education ----
+education = 
+subject_characteristics$demographics$socio.economics %>% 
+  dplyr::select(PATNO, EVENT_ID, EDUCYRS) %>% 
+  arrange(PATNO) %>% 
+  group_by(PATNO) %>% 
+  na.omit() %>% 
+  dplyr::select(-EVENT_ID) %>%
+  distinct() %>% 
+  filter(EDUCYRS == max(EDUCYRS))
+
+# Demographics ----
+demographics = subject_characteristics$demographics$demographics %>% 
+  dplyr::select(-config$variables_to_exclude) %>% 
+  dplyr::select(c("PATNO", "BIRTHDT", "SEX", "CHLDBEAR", "HANDED"))
+
+# Ethnicity ----
+## Ethnicity summary ----
+ethn_table = subject_characteristics$demographics$demographics %>% 
+  dplyr::select(-config$variables_to_exclude) %>% 
+  dplyr::select(-c("EVENT_ID", "BIRTHDT", "SEX", "CHLDBEAR", "HANDED")) %>% 
+  pivot_longer(cols = !PATNO,
+               names_to  = "ethnicity",
+               values_to = "value") %>% 
+  group_by(PATNO) %>% 
+  filter(!value %in% c(0,2, NA)) %>% 
+  arrange(PATNO, ethnicity) %>% 
+  summarise_each(funs(toString(na.omit(.)))) %>% 
+  ungroup() %>% 
+  group_by(ethnicity) %>%
+  tally() %>% 
+  arrange(- n) %>% 
+  mutate(prop = n/sum(n))
+
+ethn_table
+
+## Ethnicity dataset ----
+ethn_to_other = ethn_table$ethnicity[ethn_table$n <= 12]
+
+ethnicity = 
+subject_characteristics$demographics$demographics %>% 
+  dplyr::select(-config$variables_to_exclude) %>% 
+  dplyr::select(-c("EVENT_ID", "BIRTHDT", "SEX", "CHLDBEAR", "HANDED")) %>% 
+  pivot_longer(cols = !PATNO,
+               names_to  = "ethnicity",
+               values_to = "value") %>% 
+  group_by(PATNO) %>% 
+  filter(!value %in% c(0,2, NA)) %>% 
+  arrange(PATNO, ethnicity) %>% 
+  summarise_each(funs(toString(na.omit(.)))) %>% 
+  ungroup() %>% 
+  dplyr::select(-value) %>% 
+  mutate(race_final = ifelse(ethnicity %in% ethn_to_other, "OTHER", ethnicity))
+
+
+# Family History ----
+# Familiarity with PD (you can check father/mother sides)
+# You can find also number of children, siblings and stuff like that
+family_history = subject_characteristics$other$family_history %>%
+  dplyr::select(-config$variables_to_exclude) %>% 
+  arrange(PATNO, EVENT_ID) %>% 
+  dplyr::select(PATNO, EVENT_ID, ANYFAMPD) %>% 
+  group_by(PATNO) %>%
+  dplyr::select(-EVENT_ID) %>% 
+  summarise_each(funs(toString(na.omit(.)))) %>%
+  cSplit(., "ANYFAMPD", ",", drop = F) %>% 
+  mutate(ANYFAMPD = case_when(nchar(ANYFAMPD) == 1 ~ as.numeric(ANYFAMPD),
+                           nchar(ANYFAMPD) < 1 ~ NA_real_,
+                           nchar(ANYFAMPD) > 1 ~ as.numeric(pmax(ANYFAMPD_1, ANYFAMPD_2, ANYFAMPD_3, na.rm = T)))) %>% 
+  dplyr::select(-contains("_"))
+```
+
+Here we join every dataset that does not change over time.
+
+```{r Analysis, include=FALSE}
+core_set= plyr::join_all(list(core_set,
+                    education %>% mutate(PATNO = as.character(PATNO)),
+                    demographics %>% mutate(PATNO = as.character(PATNO)),
+                    family_history %>% mutate(PATNO = as.character(PATNO)),
+                    ethnicity %>% dplyr::select(-ethnicity) %>%  mutate(PATNO = as.character(PATNO)))
+) %>% dplyr::select(- SEX) %>% relocate(BIRTHDT, .before = EDUCYRS)
+
+core_set = core_set %>% 
+  mutate(CHLDBEAR = as.character(CHLDBEAR),
+         HANDED   = as.character(HANDED),
+         ANYFAMPD = as.character(ANYFAMPD))
+
+dvs = core_set %>% dplyr::select(-c("Cohort", "PATNO", "BIRTHDT", "label")) %>% names()
+ 
+tested = wide_tester(gp = "label", dvs = dvs, df = core_set)
+tested = tested %>% filter(! (variable == "Subgroup" & comparison != "PDC2, PDC1"))
+```
+
+Here we are removing subgroup from the testing except for PDC1 and PDC2, since it biased from enrollment. We will manually check the genetic vs non genetic comparison in subgroup for PDC1 vs PDC2. We need to build a descriptive chunk for the cohorts. We're using the cramer v for effect size in the categorical variable and the cohen's W for the wilcoxon.
+
+### Age at visit 
+
+Filtered to include only Baseline and Visits. Reporting only Baseline.
+
+```{r Age at visit}
+# Age at Visit
+subject_characteristics$demographics$age_at_visit
+lev_event = unique(subject_characteristics$demographics$age_at_visit$EVENT_ID)
+lev_event = unique(lev_event)[str_detect(unique(lev_event), paste(c("BL", "V"), collapse = "|"))]
+
+age_at_visit = left_join(core_set %>% dplyr::select(PATNO,label,GENDER),
+                         subject_characteristics$demographics$age_at_visit %>% mutate(PATNO = as.character(PATNO)),
+                         by = "PATNO")
+
+age_at_visit = age_at_visit %>% 
+  filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|")))
+
+# lme4::glmerControl()
+# Warning: calling glmer() with family=gaussian (identity link) as a shortcut to lmer() is deprecated; please call lmer() directly
+# age_model = lme4::glmer(formula = AGE_AT_VISIT ~ label*EVENT_ID + GENDER + (1|PATNO),
+#                         family  = "gaussian",
+#                         data    = age_at_visit)
+# 
+# lme4::confint.merMod(age_model, method = "Wald")
+# lme4::fixef(age_model)
+# car::Anova(age_model)
+# effsizeLMER(age_model)
+
+age_post_hoc = emmeans::emmeans(age_model, pairwise ~ label | EVENT_ID,
+                                #adjust = "tukey"
+                                )
+
+age_contra = age_post_hoc$contrasts %>%
+  tidy() %>% 
+  dplyr::filter(EVENT_ID == "BL") %>% 
+  dplyr::select(contrast, statistic, adj.p.value) %>% 
+  mutate(variable = "AGE_AT_VISIT",
+         contrast = str_replace_all(contrast,  " - ", "-"),
+         sig      = ifelse(adj.p.value <= 0.05, "yes", "no"),
+         method   = "GLMER with t-test with asymptotic adjustment for df") %>% 
+  rename(comparison=contrast,
+         p.value   = adj.p.value)
+  
+tested = bind_rows(tested, age_contra)
+```
+
+### Genetic Status
+
+Prodromal guys have a low complete rate here (gen_stat 1 <50%). When you na omit the numbers are quite ok, so we will test on the NA filtered dataset.
+
+```{r Wrangling}
+gen_stat1 = left_join(core_set, 
+                      subject_characteristics$genetic_status$ppmi_pd_variants_genetic_status_wgs_20180921 %>%
+                        mutate(PATNO = as.character(PATNO)),
+                      by = "PATNO") %>% 
+  dplyr::select(PATNO, label, all_of(names(subject_characteristics$genetic_status$ppmi_pd_variants_genetic_status_wgs_20180921)[-1]))
+
+gen_stat1 = gen_stat1 %>% 
+  group_by(label) %>%
+  na.omit() %>% 
+  mutate(across(contains("chr"), as.character))
+
+gen_stat2 = left_join(core_set, subject_characteristics$genetic_status$iu_genetic_consensus_20220310 %>% 
+                        mutate(PATNO = as.character(PATNO)) %>% 
+                        dplyr::select(PATNO, APOE, GBA_POS, LRRK2_POS),
+                      by = "PATNO") %>% 
+  dplyr::select(PATNO, label, APOE, contains("_POS")) %>% 
+  mutate(across(contains("_POS"), as.character)) %>% 
+  filter(!(GBA_POS == "-9" | LRRK2_POS == "-9")) # Removing NA subjects (only two)
+```
+
+```{r Analysis, include=FALSE}
+dvs          = names(gen_stat1)[str_detect(names(gen_stat1), "chr")]
+test_genstat = wide_tester(gp = "label", dvs = dvs, df = gen_stat1)
+dvs          = names(gen_stat2)[str_detect(names(gen_stat2), paste(c("APOE","_POS"), collapse = "|"))]
+test_genstat2= wide_tester(gp = "label", dvs = dvs, df = gen_stat2)
+
+tested_genetic_status = bind_rows(test_genstat,test_genstat2)
+
+rm(test_genstat, test_genstat2)
+```
+
+```{r SC export}
+sc_tested = list(demographics   = tested,
+                 genetic_status = tested_genetic_status)
+saveRDS(sc_tested, file = file.path(config$subjectCharacteristics$scexportdir, config$subjectCharacteristics$scexportfile))
+```
+
+## Describe demographics
+
+```{r Describe demographics}
+core_set %>% xtabs(~ label + GENDER, data = .)
+core_set %>% xtabs(~ label + CHLDBEAR, data = .)
+core_set %>% xtabs(~ label + HANDED, data = .)
+core_set %>% xtabs(~ label + ANYFAMPD, data = .)
+core_set %>% xtabs(~ label + race_final, data = .)
+
+core_set %>% 
+  group_by(label) %>% 
+  dplyr::select(label, EDUCYRS) %>% skimr::skim()
+
+# Test
+prova = core_set %>% 
+  dplyr::select(label, EDUCYRS) %>% 
+  filter(label %in% c("PDC1", "PDC2"))
+
+lm(EDUCYRS ~ label, data = prova) %>% summary()
+aov(EDUCYRS ~ label, data = prova) %>% summary()
+
+core_set %>% 
+  filter(label %in% c("PDC1", "PDC2")) %>% 
+  xtabs(~ label + Subgroup, data = .) %>% 
+  chisq.test()
+```

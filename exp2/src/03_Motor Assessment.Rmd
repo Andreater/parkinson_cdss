@@ -1,0 +1,1521 @@
+---
+title: "Untitled"
+author: "Andrea Termine"
+date: "2022-10-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../config/config r.yaml", eval.expr=TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(config$default$udfPath)
+source("udf.R")
+source("wide_rm_tester_functions.R")
+## Required Packages
+pkg = config$default$pkg
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+## Data Import
+
+```{r Basic, warning=FALSE}
+# Metadata ----
+## rna Metadata  ----
+meta_rna      = readRDS(config$metadata$rnaMetaPath)
+## Analytic Cohort metadata ----
+meta_analytic = readRDS(config$metadata$analyticMetaPath)
+## PD Labels from M3C ----
+pd_labels = read.xlsx(config$metadata$m3cLabelsPath)
+pd_labels = pd_labels %>% mutate(label = ifelse(label == 1, "PDC1", "PDC2"))
+## Codebook for columns (3 sheets)
+codebookNames   = readxl::excel_sheets(path = config$metadata$codebook)
+codebook        = vector(mode = "list", length = length(codebookNames))
+names(codebook) = codebookNames
+for (i in 1:length(codebook)) {codebook[[i]] = read.xlsx(config$metadata$codebook, sheet = i)}
+rm(codebookNames)
+
+# Actual Biomedical data ----
+## Motor Assessments
+motor_assessment = batch_csv_import(pathDir = config$motorAssessment$path)
+
+## Basic cohort data
+core_set = left_join(meta_rna %>% mutate(PATNO = as.character(PATNO)) %>% 
+                       dplyr::select(PATNO, GENDER, Cohort, Subgroup, CLINICAL_EVENT) %>% filter(CLINICAL_EVENT == "BL"),
+                     pd_labels, by = "PATNO") %>% 
+  mutate(label = ifelse(is.na(label), Cohort, label)) %>% 
+  relocate(CLINICAL_EVENT, .after = label) %>% 
+  dplyr::select(- CLINICAL_EVENT)
+
+core_set %>% 
+  xtabs(~ label, data = .)
+```
+
+On off determination dosing is summarized by PDSTATE var, so we will not use it.
+
+```{r exclude dataset}
+motor_assessment$mds.updrs_part_iii_on_off_determination___dosing = NULL
+```
+
+
+### A glance on medication
+
+Patients may have been under treatment or deep brain stimulation during the motor assessment. We will test if the PD cluster are different. These data can be found in the UPDRS part III. The determination dosing dataset is redundant and it will not be analyzed. Healthy controls and Prodromals will be excluded from this analysis because we want to compare the treatments between PD clusters in time.
+
+The variables we are interested in are:
+
+PDTRTMNT
+PDSTATE
+DBS_STATUS HAS too many missing data when checked with the timepoint checker -> **DISCARDED**
+
+PDSTATE is relevant in UPDRS part III because it tells you if the subject was responding or not to the medication during the UPDRS part III. However, we noticed that only 16 subjects have both states at the same timepoint.
+```{r parameters}
+# Select a period spanning from 0 to 2 years every six month
+selected_period = c("BL", "V02", "V04", "V05", "V06")
+# Select a period spanning from 0 to 2 years every year
+selected_period = c("BL", "V04", "V06")
+
+#df    = medication$data[[1]]
+gp      = "label"
+tp      = "EVENT_ID"
+id      = "PATNO"
+y       = "value"
+REML    = FALSE
+```
+
+```{r Wrangling the motor data}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+medication = left_join(core_set %>% dplyr::select(PATNO, label),
+                       motor_assessment$mds_updrs_part_iii %>%
+                         filter(PAG_NAME == "NUPDRS3") %>%
+                         mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID, PDTRTMNT, PDSTATE) %>% 
+  pivot_longer(cols = c("PDTRTMNT", "PDSTATE"),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value = na_if(value, ""))
+
+# Time point sanity check and filtering (selected_period)
+medication = medication %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+medication = medication %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(medication$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+medication = left_join(medication, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+# 
+medication = medication %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+medication = medication %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+
+# How many subjects with repeated measures?
+# Select only them and move on
+medication = medication %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+medication = medication %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                          .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+```
+
+```{r Testing}
+# Correct item_type ----
+medication$ITM_TYPE = c("CHAR", "CHAR")
+
+# Correct the class of the data
+# Check if Char variables are ordinal or binominal
+medication = medication %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))}
+      ))
+
+medication = medication %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+medication = medication %>%
+  mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE) {binomial_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)} ))
+
+saveRDS(medication, file = file.path(config$subjectCharacteristics$scexportdir, "medication.rds"))
+```
+
+## GAIT
+
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+gait = motor_assessment$gait_data___arm_swing
+gait = gait %>% dplyr::select(-c("COHORT", "INFODT"))
+dvs  = names(gait)[sapply(gait, is.numeric)][-1]
+
+gait = left_join(core_set %>% dplyr::select(PATNO, label),
+                      gait %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value = na_if(value, ""),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+  
+# Time point sanity check and filtering (selected_period)
+gait = gait %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+gait = gait %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(gait$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+gait = left_join(gait, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# Remove variable that were not described in the codebook
+gait = gait %>% 
+  filter(!dv %in% c("ASYM_IND_U","ASYM_IND_DT"))
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+gait = gait %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+gait = gait %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+gait = gait %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+gait = gait %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                          .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Testing ----
+gait$ITM_TYPE = rep("NUMBER", length(gait$dv))
+
+# Correct the class of the data
+gait = gait %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+# Check if Char variables are ordinal or binominal
+gait = gait %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+gait = gait %>%
+  mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {numeric_modeling(df = .x,
+                                                                                                             gp = gp,
+                                                                                                             tp = tp,
+                                                                                                             id = id,
+                                                                                                             y = y)} ))
+saveRDS(gait, file = file.path(config$subjectCharacteristics$scexportdir, "gait.rds"))
+```
+
+## UPDRS 1
+
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+updrs_1 = motor_assessment$mds.updrs_part_i
+updrs_1 = updrs_1 %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME", "NUPSOURC", "ORIG_ENTRY", "LAST_UPDATE"))
+dvs     = names(updrs_1)[str_detect(names(updrs_1), "NP1")]
+
+updrs_1 = left_join(core_set %>% dplyr::select(PATNO, label),
+                      updrs_1 %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+updrs_1$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+updrs_1 = updrs_1 %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+updrs_1 = updrs_1 %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(updrs_1$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+updrs_1 = left_join(updrs_1, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+updrs_1 = updrs_1 %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+updrs_1 = updrs_1 %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+updrs_1 = updrs_1 %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+updrs_1 = updrs_1 %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Testing ----
+# Correct the class of the data
+updrs_1 = updrs_1 %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+# Check if Char variables are ordinal or binominal
+updrs_1 = updrs_1 %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+
+updrs_1 = updrs_1 %>%
+  mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {numeric_modeling(df = .x,
+                                                                                                            gp = gp,
+                                                                                                            tp = tp,
+                                                                                                            id = id,
+                                                                                                            y = y,
+                                                                                                            REML = REML)} else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {binomial_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)} else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {ordinal_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)
+                                                                                                            }
+  ))
+
+saveRDS(updrs_1, file = file.path(config$subjectCharacteristics$scexportdir, "updrs_1.rds"))
+
+
+```
+
+## UPDRS1 PATIENT QUESTIONNAIRE
+
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+updrs_1_patient_questionnaire= motor_assessment$mds.updrs_part_i_patient_questionnaire
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+                                                                                   "NUPSOURC", "ORIG_ENTRY", "LAST_UPDATE"))
+dvs     = names(updrs_1_patient_questionnaire)[str_detect(names(updrs_1_patient_questionnaire), "NP1")]
+
+updrs_1_patient_questionnaire = left_join(core_set %>% dplyr::select(PATNO, label),
+                      updrs_1_patient_questionnaire %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+updrs_1_patient_questionnaire$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(updrs_1_patient_questionnaire$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+updrs_1_patient_questionnaire = left_join(updrs_1_patient_questionnaire, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Testing ----
+# Correct the class of the data
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(ITM_TYPE = ifelse(dv != "NP1PTOT", "CHAR", ITM_TYPE))
+
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+# Check if Char variables are ordinal or binominal
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+
+updrs_1_patient_questionnaire = updrs_1_patient_questionnaire %>%
+  mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {numeric_modeling(df = .x,
+                                                                                                            gp = gp,
+                                                                                                            tp = tp,
+                                                                                                            id = id,
+                                                                                                            y = y,
+                                                                                                            REML = REML)} else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {binomial_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)} else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {ordinal_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)
+                                                                                                            }
+  ))
+
+saveRDS(updrs_1_patient_questionnaire, file = file.path(config$subjectCharacteristics$scexportdir, "updrs_1_patient_questionnaire.rds"))
+```
+
+## UPDRS IV motor complications
+
+Here we are removing the Prodromals since they result in a not testable dataframe but PDC1 and PDC2 are testable for some variable
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+updrs_iv_motor_complications  = motor_assessment$mds.updrs_part_iv__motor_complications
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+                                                                                 "ORIG_ENTRY", "LAST_UPDATE"))
+dvs     = names(updrs_iv_motor_complications)[str_detect(names(updrs_iv_motor_complications), "NP4")]
+
+updrs_iv_motor_complications = left_join(core_set %>% dplyr::select(PATNO, label),
+                      updrs_iv_motor_complications %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         value    = na_if(value, "-5"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+# CUSTOM REMOVAL OF PRODROMAL: PAY ATTENTION
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% filter(label != "Prodromal")
+
+updrs_iv_motor_complications$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(updrs_iv_motor_complications$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+updrs_iv_motor_complications = left_join(updrs_iv_motor_complications, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# This check is needed because there are some dataset that are totally empty after rm selection
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>% 
+  filter(is_data_empty == FALSE)
+
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Testing ----
+# Correct the class of the data
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+# Check if Char variables are ordinal or binominal
+updrs_iv_motor_complications = updrs_iv_motor_complications %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+
+updrs_iv_motor_complications = updrs_iv_motor_complications %>%
+  mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {numeric_modeling(df = .x,
+                                                                                                            gp = gp,
+                                                                                                            tp = tp,
+                                                                                                            id = id,
+                                                                                                            y = y,
+                                                                                                            REML = REML)} else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {binomial_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)} else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {ordinal_modeling(df = .x, gp = gp, tp = tp, id = id, y = y)
+                                                                                                            }
+  ))
+
+saveRDS(updrs_iv_motor_complications, file = file.path(config$subjectCharacteristics$scexportdir, "updrs_iv_motor_complications.rds"))
+```
+
+## UPDRS PART II QUESTIONNAIRE
+
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+updrs_part_ii_patient_questionnaire  = motor_assessment$mds_updrs_part_ii__patient_questionnaire
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+                                                                                 "ORIG_ENTRY", "LAST_UPDATE", "NUPSOURC"))
+dvs     = names(updrs_part_ii_patient_questionnaire)[str_detect(names(updrs_part_ii_patient_questionnaire), "NP2")]
+
+updrs_part_ii_patient_questionnaire = left_join(core_set %>% dplyr::select(PATNO, label),
+                      updrs_part_ii_patient_questionnaire %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+# CUSTOM REMOVAL OF PRODROMAL: PAY ATTENTION
+# updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% filter(label != "Prodromal")
+
+updrs_part_ii_patient_questionnaire$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(updrs_part_ii_patient_questionnaire$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+updrs_part_ii_patient_questionnaire = left_join(updrs_part_ii_patient_questionnaire, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# This check is needed because there are some dataset that are totally empty after rm selection
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>% 
+  filter(is_data_empty == FALSE)
+
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Correct the class of the data
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(ITM_TYPE = ifelse(dv != "NP2PTOT", "CHAR", ITM_TYPE))
+# Testing ----
+# Correct the class of the data
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+
+# Check if Char variables are ordinal or binominal
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+
+updrs_part_ii_patient_questionnaire = updrs_part_ii_patient_questionnaire %>%
+  mutate(modeling = map(.x = data, .f = 
+                          ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+                            numeric_modeling(df = .x,
+                                             gp = gp,
+                                             tp = tp,
+                                             id = id,
+                                             y = y,
+                                             REML = REML)} else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+                                               binomial_modeling(df = .x,
+                                                                 gp = gp, 
+                                                                 tp = tp,
+                                                                 id = id,
+                                                                 y = y)} else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+                                                                   try(ordinal_modeling(df = .x,
+                                                                                        gp = gp,
+                                                                                        tp = tp,
+                                                                                        id = id,
+                                                                                        y = y))
+                                                                 }
+  ))
+
+saveRDS(updrs_part_ii_patient_questionnaire, file = file.path(config$subjectCharacteristics$scexportdir, "updrs_part_ii_patient_questionnaire.rds"))
+```
+
+## UPDRS PART III
+
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+updrs_part_iii  = motor_assessment$mds_updrs_part_iii
+updrs_part_iii = updrs_part_iii %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+                                                     "ORIG_ENTRY", "LAST_UPDATE",
+                                                     "PDMEDDT", "PDMEDTM", "PDSTATE", "EXAMTM",
+                                                     "DBS_STATUS", "PDTRTMNT", "DBSONTM", "DBSOFFTM", "HRPOSTMED",
+                                                     "HRDBSOFF", "HRDBSON"))
+dvs     = names(updrs_part_iii)[-c(1:2)]
+
+updrs_part_iii = left_join(core_set %>% dplyr::select(PATNO, label),
+                      updrs_part_iii %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+# CUSTOM REMOVAL OF PRODROMAL: PAY ATTENTION
+# updrs_part_iii = updrs_part_iii %>% filter(label != "Prodromal")
+
+updrs_part_iii$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+updrs_part_iii = updrs_part_iii %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+updrs_part_iii = updrs_part_iii %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(updrs_part_iii$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+updrs_part_iii = left_join(updrs_part_iii, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# This check is needed because there are some dataset that are totally empty after rm selection
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>% 
+  filter(is_data_empty == FALSE)
+
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Correct the class of the data
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(ITM_TYPE = ifelse(dv != "NP3TOT", "CHAR", ITM_TYPE))
+# Testing ----
+# Correct the class of the data
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+
+# Check if Char variables are ordinal or binominal
+updrs_part_iii = updrs_part_iii %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+
+updrs_part_iii = updrs_part_iii %>%
+  mutate(modeling = map(.x = data, .f = 
+                          ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+                            try(numeric_modeling(df = .x,
+                                                 gp = gp,
+                                                 tp = tp,
+                                                 id = id,
+                                                 y = y,
+                                                 REML = REML))
+                          } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+                            try(binomial_modeling(df = .x,
+                                                  gp = gp, 
+                                                  tp = tp,
+                                                  id = id,
+                                                  y = y))
+                          } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+                            try(ordinal_modeling(df = .x,
+                                                 gp = gp,
+                                                 tp = tp,
+                                                 id = id,
+                                                 y = y))
+                          }
+  ))
+
+saveRDS(updrs_part_iii, file = file.path(config$subjectCharacteristics$scexportdir, "updrs_part_iii.rds"))
+```
+
+## SCHWAB
+
+```{r}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+schwab = motor_assessment$modified_schwab___england_activities_of_daily_living
+schwab = schwab %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+                                     "ORIG_ENTRY", "LAST_UPDATE"))
+dvs     = "MSEADLG"
+
+schwab = left_join(core_set %>% dplyr::select(PATNO, label),
+                      schwab %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+# CUSTOM REMOVAL OF PRODROMAL: PAY ATTENTION
+# schwab = schwab %>% filter(label != "Prodromal")
+
+schwab$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+schwab = schwab %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+schwab = schwab %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(schwab$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+schwab = left_join(schwab, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+schwab = schwab %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+schwab = schwab %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+schwab = schwab %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# This check is needed because there are some dataset that are totally empty after rm selection
+schwab = schwab %>% 
+  mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>% 
+  filter(is_data_empty == FALSE)
+
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+schwab = schwab %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Correct the class of the data
+# schwab = schwab %>% 
+#   mutate(ITM_TYPE = ifelse(dv != "NP3TOT", "CHAR", ITM_TYPE))
+# Testing ----
+# Correct the class of the data
+schwab = schwab %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+
+# Check if Char variables are ordinal or binominal
+schwab = schwab %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+schwab = schwab %>%
+  mutate(modeling = map(.x = data, .f = 
+                          ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+                            try(numeric_modeling(df = .x,
+                                                 gp = gp,
+                                                 tp = tp,
+                                                 id = id,
+                                                 y = y,
+                                                 REML = REML))
+                          } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+                            try(binomial_modeling(df = .x,
+                                                  gp = gp, 
+                                                  tp = tp,
+                                                  id = id,
+                                                  y = y))
+                          } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+                            try(ordinal_modeling(df = .x,
+                                                 gp = gp,
+                                                 tp = tp,
+                                                 id = id,
+                                                 y = y))
+                          }
+  ))
+
+saveRDS(schwab, file = file.path(config$subjectCharacteristics$scexportdir, "schwab.rds"))
+```
+
+## NEUROQOL LOWER
+
+**Removed, no data remained**
+**Skipping also the upper interview**
+
+```{r}
+# # 1 Data Wrangling ----
+# # check the value column uniques to see if something strange pops ups and address it in the last mutate
+# neuro_qol_lower = motor_assessment$neuro_qol__lower_extremity_function__mobility__._short_form
+# neuro_qol_lower = neuro_qol_lower %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+#                                                        "ORIG_ENTRY", "LAST_UPDATE"))
+# dvs     = names(neuro_qol_lower)[str_detect(names(neuro_qol_lower), "NQ")]
+# 
+# neuro_qol_lower = left_join(core_set %>% dplyr::select(PATNO, label),
+#                       neuro_qol_lower %>%
+#                         mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+#   dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+#   pivot_longer(cols = all_of(dvs),
+#                names_to = "dv",
+#                values_to= "value",
+#                values_transform = as.character) %>% 
+#   mutate(value    = na_if(value, ""),
+#          value    = na_if(value,"UR"),
+#          EVENT_ID = na_if(EVENT_ID, "")) %>%
+#   filter(!is.na(EVENT_ID))
+# 
+# # CUSTOM REMOVAL OF PRODROMAL: PAY ATTENTION
+# # neuro_qol_lower = neuro_qol_lower %>% filter(label != "Prodromal")
+# 
+# neuro_qol_lower$value %>% unique()
+#   
+# # Time point sanity check and filtering (selected_period)
+# neuro_qol_lower = neuro_qol_lower %>% 
+# filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+#   mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+#          EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+#          EVENT_ID = as.factor(EVENT_ID)) %>%
+#   filter(EVENT_ID %in% selected_period) %>% 
+#   mutate(EVENT_ID = droplevels(EVENT_ID))
+# 
+# # Nesting
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   group_by(dv) %>%
+#   nest()
+#  
+# # Adding information about the dependent variable
+# y_annotation = codebook$data_dictionary_annotated %>% 
+#   filter(ITM_NAME %in% unique(neuro_qol_lower$dv)) %>% 
+#   dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+#   rename(dv = ITM_NAME)
+# 
+# neuro_qol_lower = left_join(neuro_qol_lower, y_annotation, by = "dv") %>% 
+#   relocate(ITM_TYPE, DSCR, .before = data)
+# rm(y_annotation)
+# 
+# # 2 Dataframe Sanity check ----
+# # Check the duplicates and decide what to do (manual) 
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+#          patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+#          data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+#   unnest(n_duplicates)
+# 
+# # MVA ----
+# # Group level (Are there groups that are totally empty regardless the timepoint?)
+# # if yes  remove useless groups updating data
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+#                                         distinct() %>% 
+#                                         group_by(label) %>% 
+#                                         summarise(n_subjects  = n(),
+#                                                   n_na        = sum(is.na(value))) %>% 
+#                                         mutate(na_percentage = round((n_na/n_subjects)*100,2),
+#                                                discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+#                                                )),
+#          mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+#          data                 = map(.x = data, .f = ~ .x %>% 
+#                       filter(!label %in% unlist(mva_group_to_discard)))) 
+# 
+# # How many subjects with repeated measures?
+# # Select only them and move on
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+#                              group_by(PATNO) %>%
+#                              tally() %>%
+#                              filter(n == length(selected_period)) %>%
+#                              .$PATNO),
+#          data       = map(.x = data, .f =~ .x %>% 
+#                             filter(PATNO %in% unlist(rm_subjects)))) 
+# 
+# # This check is needed because there are some dataset that are totally empty after rm selection
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>% 
+#   filter(is_data_empty == FALSE)
+# 
+# 
+# # Verify NA percentage
+# # in the dataset (dataset missingness)
+# # in the rows (na_percentage_row_checker)
+# # remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# # check how many subjects are left
+# # Declare if n is sufficient to test
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+#          mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+#          data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+#          mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+#          mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+#                                                group_by(label, EVENT_ID) %>% 
+#                                                summarise(n = n(),
+#                                                          is_testable = ifelse(n> 20, TRUE, FALSE),
+#                                                          .groups = "drop")),
+#          is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# # Correct the class of the data
+# # neuro_qol_lower = neuro_qol_lower %>% 
+# #   mutate(ITM_TYPE = ifelse(dv != "NP3TOT", "CHAR", ITM_TYPE))
+# # Testing ----
+# # Correct the class of the data
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+#       mutate(value = as.factor(value))} else {
+#         .x %>% mutate(value = as.numeric(value))}
+#       ))
+# 
+# 
+# # Check if Char variables are ordinal or binominal
+# neuro_qol_lower = neuro_qol_lower %>% 
+#   mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+#   relocate(nlev, .after = DSCR)
+# 
+# neuro_qol_lower = neuro_qol_lower %>%
+#   mutate(modeling = map(.x = data, .f = 
+#                           ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+#                             try(numeric_modeling(df = .x,
+#                                                  gp = gp,
+#                                                  tp = tp,
+#                                                  id = id,
+#                                                  y = y,
+#                                                  REML = REML))
+#                           } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+#                             try(binomial_modeling(df = .x,
+#                                                   gp = gp, 
+#                                                   tp = tp,
+#                                                   id = id,
+#                                                   y = y))
+#                           } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+#                             try(ordinal_modeling(df = .x,
+#                                                  gp = gp,
+#                                                  tp = tp,
+#                                                  id = id,
+#                                                  y = y))
+#                           }
+#   ))
+# 
+# saveRDS(neuro_qol_lower, file = file.path(config$subjectCharacteristics$scexportdir, "neuro_qol_lower.rds"))
+```
+
+## PARTICIPANT QUESTIONNAIRE
+
+**Not enough observation for PD in the selected Period. Dataframe discarded.**
+
+```{r eval=FALSE, include=FALSE}
+# 1 Data Wrangling ----
+# check the value column uniques to see if something strange pops ups and address it in the last mutate
+participant_motor_questionnaire = motor_assessment$participant_motor_function_questionnaire
+participant_motor_questionnaire = participant_motor_questionnaire %>% dplyr::select(-c("INFODT", "REC_ID", "PAG_NAME",
+                                                                                       "ORIG_ENTRY", "LAST_UPDATE"))
+
+dvs     = names(participant_motor_questionnaire)[sapply(participant_motor_questionnaire, is.numeric)][-1]
+
+participant_motor_questionnaire = left_join(core_set %>% dplyr::select(PATNO, label),
+                      participant_motor_questionnaire %>%
+                        mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID,all_of(dvs)) %>% 
+  pivot_longer(cols = all_of(dvs),
+               names_to = "dv",
+               values_to= "value",
+               values_transform = as.character) %>% 
+  mutate(value    = na_if(value, ""),
+         value    = na_if(value,"UR"),
+         EVENT_ID = na_if(EVENT_ID, "")) %>%
+  filter(!is.na(EVENT_ID))
+
+# CUSTOM REMOVAL OF PRODROMAL: PAY ATTENTION
+# participant_motor_questionnaire = participant_motor_questionnaire %>% filter(label != "Prodromal")
+
+participant_motor_questionnaire$value %>% unique()
+  
+# Time point sanity check and filtering (selected_period)
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+# Nesting
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  group_by(dv) %>%
+  nest()
+ 
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(participant_motor_questionnaire$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+participant_motor_questionnaire = left_join(participant_motor_questionnaire, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# 2 Dataframe Sanity check ----
+# Check the duplicates and decide what to do (manual) 
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+         patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+         data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+  unnest(n_duplicates)
+
+# MVA ----
+# Group level (Are there groups that are totally empty regardless the timepoint?)
+# if yes  remove useless groups updating data
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                        distinct() %>% 
+                                        group_by(label) %>% 
+                                        summarise(n_subjects  = n(),
+                                                  n_na        = sum(is.na(value))) %>% 
+                                        mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                               discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                               )),
+         mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+         data                 = map(.x = data, .f = ~ .x %>% 
+                      filter(!label %in% unlist(mva_group_to_discard)))) 
+
+# How many subjects with repeated measures?
+# Select only them and move on
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                             group_by(PATNO) %>%
+                             tally() %>%
+                             filter(n == length(selected_period)) %>%
+                             .$PATNO),
+         data       = map(.x = data, .f =~ .x %>% 
+                            filter(PATNO %in% unlist(rm_subjects)))) 
+
+# This check is needed because there are some dataset that are totally empty after rm selection
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>% 
+  filter(is_data_empty == FALSE)
+
+
+# Verify NA percentage
+# in the dataset (dataset missingness)
+# in the rows (na_percentage_row_checker)
+# remove the na subjects in all timepoints. These subjects  have number  of na > 0
+# check how many subjects are left
+# Declare if n is sufficient to test
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+         mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+         data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+         mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+         mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                               group_by(label, EVENT_ID) %>% 
+                                               summarise(n = n(),
+                                                         is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                         .groups = "drop")),
+         is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+# Correct the class of the data
+# participant_motor_questionnaire = participant_motor_questionnaire %>% 
+#   mutate(ITM_TYPE = ifelse(dv != "NP3TOT", "CHAR", ITM_TYPE))
+# Testing ----
+# Correct the class of the data
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+      mutate(value = as.factor(value))} else {
+        .x %>% mutate(value = as.numeric(value))}
+      ))
+
+
+# Check if Char variables are ordinal or binominal
+participant_motor_questionnaire = participant_motor_questionnaire %>% 
+  mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+  relocate(nlev, .after = DSCR)
+
+participant_motor_questionnaire = participant_motor_questionnaire %>%
+  mutate(modeling = map(.x = data, .f = 
+                          ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+                            try(numeric_modeling(df = .x,
+                                                 gp = gp,
+                                                 tp = tp,
+                                                 id = id,
+                                                 y = y,
+                                                 REML = REML))
+                          } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+                            try(binomial_modeling(df = .x,
+                                                  gp = gp, 
+                                                  tp = tp,
+                                                  id = id,
+                                                  y = y))
+                          } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+                            try(ordinal_modeling(df = .x,
+                                                 gp = gp,
+                                                 tp = tp,
+                                                 id = id,
+                                                 y = y))
+                          }
+  ))
+
+saveRDS(participant_motor_questionnaire, file = file.path(config$subjectCharacteristics$scexportdir, "participant_motor_questionnaire.rds"))
+```
+
+
+
+
+
