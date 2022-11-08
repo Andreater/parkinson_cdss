@@ -1,0 +1,733 @@
+---
+title: "Untitled"
+author: "Andrea Termine"
+date: "2022-10-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r config}
+# plant a seed
+set.seed(12345)
+
+# Path to config
+config = yaml::read_yaml(file = "../config/config r.yaml", eval.expr=TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# Import custom functions
+source(config$default$udfPath)
+source("udf.R")
+source("wide_rm_tester_functions.R")
+source("testfix.R")
+## Required Packages
+pkg = config$default$pkg
+
+## Now load or install & load all // Cran version
+load_packages(pkgs = pkg)
+# cat("Libraries Imported")
+rm(pkg,p)
+```
+
+## Data Import
+
+```{r Basic, warning=FALSE}
+# Metadata ----
+## rna Metadata  ----
+meta_rna      = readRDS(config$metadata$rnaMetaPath)
+## Analytic Cohort metadata ----
+meta_analytic = readRDS(config$metadata$analyticMetaPath)
+## PD Labels from M3C ----
+pd_labels = read.xlsx(config$metadata$m3cLabelsPath)
+pd_labels = pd_labels %>% mutate(label = ifelse(label == 1, "PDC1", "PDC2"))
+## Codebook for columns (3 sheets)
+codebookNames   = readxl::excel_sheets(path = config$metadata$codebook)
+codebook        = vector(mode = "list", length = length(codebookNames))
+names(codebook) = codebookNames
+for (i in 1:length(codebook)) {codebook[[i]] = read.xlsx(config$metadata$codebook, sheet = i)}
+rm(codebookNames)
+
+# Actual Biomedical data ----
+## Biospec
+biospecimen = read.csv(config$biospecimen$cr)
+
+## Basic cohort data
+core_set = left_join(meta_rna %>% mutate(PATNO = as.character(PATNO)) %>% 
+                       dplyr::select(PATNO, GENDER, Cohort, Subgroup, CLINICAL_EVENT) %>% filter(CLINICAL_EVENT == "BL"),
+                     pd_labels, by = "PATNO") %>% 
+  mutate(label = ifelse(is.na(label), Cohort, label)) %>% 
+  relocate(CLINICAL_EVENT, .after = label) %>% 
+  dplyr::select(- CLINICAL_EVENT)
+
+core_set %>% 
+  xtabs(~ label, data = .)
+```
+
+```{r parameters}
+# Select a period spanning from 0 to 2 years every six month
+selected_period = c("BL", "V02", "V04", "V05", "V06")
+# Select a period spanning from 0 to 2 years every year
+selected_period = c("BL", "V04", "V06")
+
+#df    = medication$data[[1]]
+gp      = "label"
+tp      = "EVENT_ID"
+id      = "PATNO"
+y       = "value"
+REML    = FALSE
+```
+
+```{r}
+biospecimen = biospecimen %>% 
+  dplyr::select(-c("COHORT", "RUNDATE", "PROJECTID", "PI_NAME", "PI_INSTITUTION", "update_stamp", "SEX")) %>% 
+  rename(EVENT_ID = CLINICAL_EVENT,
+         dv      = TESTNAME,
+         value    = TESTVALUE) 
+biospecimen = left_join(core_set %>% dplyr::select(PATNO, label),
+                        biospecimen %>%
+                          mutate(PATNO = as.character(PATNO)),
+                        by = "PATNO") %>% 
+  dplyr::select(PATNO, label, EVENT_ID, TYPE, UNITS, everything())
+
+
+biospecimen = biospecimen %>% 
+     mutate(value    = na_if(value, ""),
+           value    = na_if(value,"UR"),
+           value    = na_if(value, "Indeterminate"),
+           value    = na_if(value, "n.a."),
+           value   = na_if(value, "Undetermined"),
+           value   = na_if(value, "-"),
+           value   = tolower(value),
+           EVENT_ID = na_if(EVENT_ID, "")) %>%
+    filter(!is.na(EVENT_ID))
+
+  
+
+# Time point sanity check and filtering (selected_period)
+biospecimen = biospecimen %>% 
+  filter(str_detect(EVENT_ID, pattern = paste(c("BL", "V"), collapse = "|"))) %>%
+  mutate(EVENT_ID = str_replace_all(string = EVENT_ID, pattern = "V0", replacement = "V"),
+         EVENT_ID = ifelse(str_count(EVENT_ID) == 2 & EVENT_ID != "BL", str_replace_all(EVENT_ID, "V", "V0"), EVENT_ID),
+         EVENT_ID = as.factor(EVENT_ID)) %>%
+  filter(EVENT_ID %in% selected_period) %>% 
+  mutate(EVENT_ID = droplevels(EVENT_ID))
+
+
+biospecimen$EVENT_ID %>% unique()
+
+biospecimen_list = split(biospecimen, biospecimen$TYPE)
+names(biospecimen_list) = names(biospecimen_list) %>% make.names()
+```
+
+## DNA 
+DNA has less than 20 observation in critical groups like PDC1 and/or PDC2 or is empty. 
+
+```{r}
+test = biospecimen_list$DNA %>% 
+  group_by(dv) %>% 
+  nest(data = c("PATNO", "label", "EVENT_ID", "value")) %>% 
+  relocate(dv, TYPE, UNITS) %>% 
+  mutate(UNITS = na_if(UNITS,""))
+
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(test$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+test = left_join(test, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+test = test %>% 
+  mutate(data = map(.x = data, .f = ~ .x %>% dplyr::select(-EVENT_ID) %>% distinct()))
+
+test = test %>% 
+  mutate(n_subjects = map(.x = data, .f = ~ .x %>% 
+                            group_by(label) %>% 
+                            tally() %>% 
+                            mutate(are_there_enough_subjects=ifelse(n>=20, TRUE, FALSE))),
+         not_enough_subjects = map(.x = n_subjects, .f = ~ .x$label[.x$are_there_enough_subjects == FALSE]))
+
+
+prova = test %>% 
+  mutate(data     = map(.x = data, .f = ~ .x %>% filter(!label %in% unlist(not_enough_subjects))),
+         is_empty = map(.x = data, .f = ~ plyr::empty(.x)),
+    index = case_when(str_detect(not_enough_subjects, paste(c("PDC1", "PDC2"), collapse = "|")) ~ FALSE,
+                      is_empty == TRUE ~ FALSE))
+```
+
+## CSF
+
+```{r}
+test = biospecimen_list$Cerebrospinal.Fluid %>% 
+  group_by(dv) %>% 
+  nest(data = c("PATNO", "label", "EVENT_ID", "value")) %>% 
+  relocate(dv, TYPE, UNITS) %>% 
+  mutate(UNITS = na_if(UNITS,""))
+
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(test$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+test = left_join(test, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# Check the duplicates and decide what to do (manual) 
+  test = test %>% 
+    mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+           patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+           data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+    unnest(n_duplicates)
+  
+  # MVA ----
+  # Group level (Are there groups that are totally empty regardless the timepoint?)
+  # if yes  remove useless groups updating data
+  test = test %>% 
+    mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                          distinct() %>% 
+                                          group_by(label) %>% 
+                                          summarise(n_subjects  = n(),
+                                                    n_na        = sum(is.na(value))) %>% 
+                                          mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                                 discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                          )),
+           mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+           data                 = map(.x = data, .f = ~ .x %>% 
+                                        filter(!label %in% unlist(mva_group_to_discard)))) 
+  
+  # How many subjects with repeated measures?
+  # Select only them and move on
+  test = test %>% 
+    mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                               group_by(PATNO) %>%
+                               tally() %>%
+                               filter(n == length(selected_period)) %>%
+                               .$PATNO),
+           data       = map(.x = data, .f =~ .x %>% 
+                              filter(PATNO %in% unlist(rm_subjects)))) 
+  #  This check is needed because there are some dataset that are totally empty after rm selection
+  test = test %>%
+    mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>%
+    filter(is_data_empty == FALSE)
+
+  test = test %>% 
+    mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+           mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+           data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+           mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+           mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                                 group_by(label, EVENT_ID) %>% 
+                                                 summarise(n = n(),
+                                                           is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                           .groups = "drop")),
+           is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+
+test$ITM_TYPE =  replace_na(test$ITM_TYPE, "NUMBER")  
+test = test %>% 
+    mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+        mutate(value = as.factor(value))} else {
+          .x %>% mutate(value = as.numeric(value))}
+    ))
+  
+
+  # Check if Char variables are ordinal or binominal
+  test = test %>% 
+    filter(dv != "Seed Amplification Assay (Amprion Clinical Laboratory Exploratory Endpoint)") %>% 
+    mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+    relocate(nlev, .after = DSCR)
+  
+  
+  test = test %>%
+    mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+      try(numeric_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y  = y,
+                           REML = REML))
+    } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+      try(binomial_modeling(df = .x,
+                            gp = gp,
+                            tp = tp,
+                            id = id,
+                            y = y))
+    } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+      try(ordinal_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y = y))
+      
+    }
+    ))
+  
+csf = test
+```
+
+## CELL LINE
+We don't care about IPSC ATM
+
+## PLASMA
+```{r}
+test = biospecimen_list$Plasma %>% 
+  group_by(dv) %>% 
+  nest(data = c("PATNO", "label", "EVENT_ID", "value")) %>% 
+  relocate(dv, TYPE, UNITS) %>% 
+  mutate(UNITS = na_if(UNITS,""))
+
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(test$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+test = left_join(test, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# Check the duplicates and decide what to do (manual) 
+  test = test %>% 
+    mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+           patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+           data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+    unnest(n_duplicates)
+  
+  # MVA ----
+  # Group level (Are there groups that are totally empty regardless the timepoint?)
+  # if yes  remove useless groups updating data
+  test = test %>% 
+    mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                          distinct() %>% 
+                                          group_by(label) %>% 
+                                          summarise(n_subjects  = n(),
+                                                    n_na        = sum(is.na(value))) %>% 
+                                          mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                                 discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                          )),
+           mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+           data                 = map(.x = data, .f = ~ .x %>% 
+                                        filter(!label %in% unlist(mva_group_to_discard)))) 
+  
+  # How many subjects with repeated measures?
+  # Select only them and move on
+  test = test %>% 
+    mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                               group_by(PATNO) %>%
+                               tally() %>%
+                               filter(n == length(selected_period)) %>%
+                               .$PATNO),
+           data       = map(.x = data, .f =~ .x %>% 
+                              filter(PATNO %in% unlist(rm_subjects)))) 
+  #  This check is needed because there are some dataset that are totally empty after rm selection
+  test = test %>%
+    mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>%
+    filter(is_data_empty == FALSE)
+
+  test = test %>% 
+    mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+           mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+           data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+           mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+           mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                                 group_by(label, EVENT_ID) %>% 
+                                                 summarise(n = n(),
+                                                           is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                           .groups = "drop")),
+           is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+
+test$ITM_TYPE =  replace_na(test$ITM_TYPE, "NUMBER")  
+test = test %>% 
+    mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+        mutate(value = as.factor(value))} else {
+          .x %>% mutate(value = as.numeric(value))}
+    ))
+  
+
+  # Check if Char variables are ordinal or binominal
+  test = test %>% 
+    mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+    relocate(nlev, .after = DSCR)
+  
+  
+  test = test %>%
+    mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+      try(numeric_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y  = y,
+                           REML = REML))
+    } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+      try(binomial_modeling(df = .x,
+                            gp = gp,
+                            tp = tp,
+                            id = id,
+                            y = y))
+    } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+      try(ordinal_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y = y))
+      
+    }
+    ))
+  
+plasma = test
+```
+
+## RNA
+
+Gene expression data will be analyzed using bioinformatics tools and therefore we're not analyzing them here.
+
+## SERUM
+```{r}
+test = biospecimen_list$Serum %>% 
+  group_by(dv) %>% 
+  nest(data = c("PATNO", "label", "EVENT_ID", "value")) %>% 
+  relocate(dv, TYPE, UNITS) %>% 
+  mutate(UNITS = na_if(UNITS,""))
+
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(test$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+test = left_join(test, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# Check the duplicates and decide what to do (manual) 
+  test = test %>% 
+    mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+           patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+           data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+    unnest(n_duplicates)
+  
+  # MVA ----
+  # Group level (Are there groups that are totally empty regardless the timepoint?)
+  # if yes  remove useless groups updating data
+  test = test %>% 
+    mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                          distinct() %>% 
+                                          group_by(label) %>% 
+                                          summarise(n_subjects  = n(),
+                                                    n_na        = sum(is.na(value))) %>% 
+                                          mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                                 discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                          )),
+           mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+           data                 = map(.x = data, .f = ~ .x %>% 
+                                        filter(!label %in% unlist(mva_group_to_discard)))) 
+  
+  # How many subjects with repeated measures?
+  # Select only them and move on
+  test = test %>% 
+    mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                               group_by(PATNO) %>%
+                               tally() %>%
+                               filter(n == length(selected_period)) %>%
+                               .$PATNO),
+           data       = map(.x = data, .f =~ .x %>% 
+                              filter(PATNO %in% unlist(rm_subjects)))) 
+  #  This check is needed because there are some dataset that are totally empty after rm selection
+  test = test %>%
+    mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>%
+    filter(is_data_empty == FALSE)
+
+  test = test %>% 
+    mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+           mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+           data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+           mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+           mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                                 group_by(label, EVENT_ID) %>% 
+                                                 summarise(n = n(),
+                                                           is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                           .groups = "drop")),
+           is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+
+test$ITM_TYPE =  replace_na(test$ITM_TYPE, "NUMBER")  
+test = test %>% 
+    mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+        mutate(value = as.factor(value))} else {
+          .x %>% mutate(value = as.numeric(value))}
+    ))
+  
+
+  # Check if Char variables are ordinal or binominal
+  test = test %>% 
+    mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+    relocate(nlev, .after = DSCR)
+  
+  
+  test = test %>%
+    mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+      try(numeric_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y  = y,
+                           REML = REML))
+    } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+      try(binomial_modeling(df = .x,
+                            gp = gp,
+                            tp = tp,
+                            id = id,
+                            y = y))
+    } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+      try(ordinal_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y = y))
+      
+    }
+    ))
+  
+serum = test
+```
+
+## URINE
+
+Data are not testable due to low sample size. Removed.
+
+```{r}
+test = biospecimen_list$Urine %>% 
+  group_by(dv) %>% 
+  nest(data = c("PATNO", "label", "EVENT_ID", "value")) %>% 
+  relocate(dv, TYPE, UNITS) %>% 
+  mutate(UNITS = na_if(UNITS,""))
+
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(test$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+test = left_join(test, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# Check the duplicates and decide what to do (manual) 
+  test = test %>% 
+    mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+           patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+           data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+    unnest(n_duplicates)
+  
+  # MVA ----
+  # Group level (Are there groups that are totally empty regardless the timepoint?)
+  # if yes  remove useless groups updating data
+  test = test %>% 
+    mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                          distinct() %>% 
+                                          group_by(label) %>% 
+                                          summarise(n_subjects  = n(),
+                                                    n_na        = sum(is.na(value))) %>% 
+                                          mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                                 discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                          )),
+           mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+           data                 = map(.x = data, .f = ~ .x %>% 
+                                        filter(!label %in% unlist(mva_group_to_discard)))) 
+  
+  # How many subjects with repeated measures?
+  # Select only them and move on
+  test = test %>% 
+    mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                               group_by(PATNO) %>%
+                               tally() %>%
+                               filter(n == length(selected_period)) %>%
+                               .$PATNO),
+           data       = map(.x = data, .f =~ .x %>% 
+                              filter(PATNO %in% unlist(rm_subjects)))) 
+  #  This check is needed because there are some dataset that are totally empty after rm selection
+  test = test %>%
+    mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>%
+    filter(is_data_empty == FALSE)
+
+  test = test %>% 
+    mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+           mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+           data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+           mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+           mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                                 group_by(label, EVENT_ID) %>% 
+                                                 summarise(n = n(),
+                                                           is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                           .groups = "drop")),
+           is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+
+test$ITM_TYPE =  replace_na(test$ITM_TYPE, "NUMBER")  
+test = test %>% 
+    mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+        mutate(value = as.factor(value))} else {
+          .x %>% mutate(value = as.numeric(value))}
+    ))
+  
+
+  # Check if Char variables are ordinal or binominal
+  test = test %>% 
+    mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+    relocate(nlev, .after = DSCR)
+  
+  
+  test = test %>%
+    mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+      try(numeric_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y  = y,
+                           REML = REML))
+    } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+      try(binomial_modeling(df = .x,
+                            gp = gp,
+                            tp = tp,
+                            id = id,
+                            y = y))
+    } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+      try(ordinal_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y = y))
+      
+    }
+    ))
+  
+urine = test
+```
+
+## Whole Blood
+
+
+
+```{r}
+test = biospecimen_list$Whole.Blood %>% 
+  group_by(dv) %>% 
+  nest(data = c("PATNO", "label", "EVENT_ID", "value")) %>% 
+  relocate(dv, TYPE, UNITS) %>% 
+  mutate(UNITS = na_if(UNITS,""))
+
+# Adding information about the dependent variable
+y_annotation = codebook$data_dictionary_annotated %>% 
+  filter(ITM_NAME %in% unique(test$dv)) %>% 
+  dplyr::select(ITM_NAME, DSCR, ITM_TYPE) %>% 
+  rename(dv = ITM_NAME)
+
+test = left_join(test, y_annotation, by = "dv") %>% 
+  relocate(ITM_TYPE, DSCR, .before = data)
+rm(y_annotation)
+
+# Check the duplicates and decide what to do (manual) 
+  test = test %>% 
+    mutate(n_duplicates     = map(.x = data, .f =~ .x %>% duplicated() %>% sum()),
+           patno_duplicates = map(.x = data, .f =~ .x$PATNO[which(duplicated(.x))]),
+           data             = map(.x = data, .f =~ .x %>% distinct())) %>% 
+    unnest(n_duplicates)
+  
+  # MVA ----
+  # Group level (Are there groups that are totally empty regardless the timepoint?)
+  # if yes  remove useless groups updating data
+  test = test %>% 
+    mutate(mva_discard_group_data = map(.x = data, .f=~  .x %>% 
+                                          distinct() %>% 
+                                          group_by(label) %>% 
+                                          summarise(n_subjects  = n(),
+                                                    n_na        = sum(is.na(value))) %>% 
+                                          mutate(na_percentage = round((n_na/n_subjects)*100,2),
+                                                 discard_group = ifelse(na_percentage >= 90, TRUE, FALSE),
+                                          )),
+           mva_group_to_discard = map(.x = mva_discard_group_data, .f =~ .x$label[.x$discard_group == TRUE]),
+           data                 = map(.x = data, .f = ~ .x %>% 
+                                        filter(!label %in% unlist(mva_group_to_discard)))) 
+  
+  # How many subjects with repeated measures?
+  # Select only them and move on
+  test = test %>% 
+    mutate(rm_subjects = map(.x = data, .f =~ .x %>%
+                               group_by(PATNO) %>%
+                               tally() %>%
+                               filter(n == length(selected_period)) %>%
+                               .$PATNO),
+           data       = map(.x = data, .f =~ .x %>% 
+                              filter(PATNO %in% unlist(rm_subjects)))) 
+  #  This check is needed because there are some dataset that are totally empty after rm selection
+  test = test %>%
+    mutate(is_data_empty = map(.x= data, .f = ~ plyr::empty(.x) )) %>%
+    filter(is_data_empty == FALSE)
+
+  test = test %>% 
+    mutate(mva_start_dataset_missingness = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100,2))),
+           mva_na_percentage_row_checker = map(.x = data, .f =~ .x$PATNO[narows_percent(.x) > 0]),
+           data                          = map(.x = data, .f =~ .x %>% filter(!PATNO %in% unlist(mva_na_percentage_row_checker))),
+           mva_end_dataset_missingness   = unlist(map(.x = data, .f =~ round(datasetmissingness(.x)*100, 2))),
+           mva_summary_n_subject         = map(.x = data, .f =~ .x %>% 
+                                                 group_by(label, EVENT_ID) %>% 
+                                                 summarise(n = n(),
+                                                           is_testable = ifelse(n> 20, TRUE, FALSE),
+                                                           .groups = "drop")),
+           is_testable                   = map(.x = mva_summary_n_subject, .f= ~ .x$is_testable %>% all()))
+
+test$ITM_TYPE =  replace_na(test$ITM_TYPE, "NUMBER")  
+test = test %>% 
+    mutate(data = map(.x = data, .f=~ if (ITM_TYPE == "CHAR") { .x %>% 
+        mutate(value = as.factor(value))} else {
+          .x %>% mutate(value = as.numeric(value))}
+    ))
+  
+
+  # Check if Char variables are ordinal or binominal
+  test = test %>% 
+    mutate(nlev = unlist(map(.x= data, .f = ~ ifelse(ITM_TYPE == "CHAR", .x %>% .$value %>% nlevels(), NA_real_)))) %>% 
+    relocate(nlev, .after = DSCR)
+  
+  
+  test = test %>%
+    mutate(modeling = map(.x = data, .f = ~ if (is_testable == TRUE & ITM_TYPE == "NUMBER") {
+      try(numeric_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y  = y,
+                           REML = REML))
+    } else if (is_testable == TRUE & ITM_TYPE == "CHAR" & nlev == 2) {
+      try(binomial_modeling(df = .x,
+                            gp = gp,
+                            tp = tp,
+                            id = id,
+                            y = y))
+    } else if(is_testable == TRUE & ITM_TYPE == "CHAR" & nlev > 2) {
+      try(ordinal_modeling(df = .x,
+                           gp = gp,
+                           tp = tp,
+                           id = id,
+                           y = y))
+      
+    }
+    ))
+  
+whole.blood = test
+```
+
+# Export
+
+```{r}
+res.list = list(plasma = plasma,
+     csf    = csf,
+     whole.blood = whole.blood)
+
+saveRDS(res.list, file = file.path(config$subjectCharacteristics$scexportdir, "biospecimen.rds"))
+
+```
+
