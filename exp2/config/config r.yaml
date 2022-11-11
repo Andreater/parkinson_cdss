@@ -6,7 +6,8 @@ default:
   parent: !expr dirname(dirname(getwd()))
   udfPath: "../../scripts/functions.r"
   pkg: !expr c("tidyverse", "yaml", "fst", "openxlsx", "splitstackshape", "rstatix",
-        "lme4", "cvms", "groupdata2", "mice", "emmeans", "rsq", "ordinal", "rcompanion")
+        "lme4", "cvms", "groupdata2", "mice", "emmeans", "rsq", "ordinal", "rcompanion",
+        "quanteda", "reticulate", "spacyr", "quanteda.textstats")
   
 metadata:
   studyDir: !expr file.path("../../", "data", "study_data")
