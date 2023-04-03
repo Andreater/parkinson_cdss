@@ -1,4 +1,4 @@
-# Predicting PD progression using smartwatch data.
+# Predicting PD progression using smartwatch data
 
 
 ## Abstract
@@ -20,7 +20,7 @@ We also tested the hypothesis that daily usage of the Verily Study Watch was inf
 
 
 
-![compliance](docs/compliance analysis.png)
+![compliance](docs/compliance_analysis.png)
 
 
 Fig.1 Summary of the compliance analysis. A) Kaplan-Meier plot illustrating the completion rate (CR) of the study for each Strata. At 1 year (52 weeks) CR was estimated at 0.53, 0.62 0.66 for HC, PD and Prodromal individuals. B) Box plot illustrating the average daily use for each strata. After the Kruskal Wallis we used the Wilcoxon rank sum test with continuity correction to generate the post hoc p-values. C) The average percentages of weekly use in approximately 1 year of the experiment (≈52 weeks). D) A forest plot representing the Cox Proportional Hazards Model that was used to test the hypothesis that clinical status and demographic features may influence the duration of the study. 
