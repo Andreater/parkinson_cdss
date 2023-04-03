@@ -1,31 +1,3 @@
-<!-----
-
-You have some errors, warnings, or alerts. If you are using reckless mode, turn it off to see inline alerts.
-* ERRORs: 0
-* WARNINGs: 0
-* ALERTS: 3
-
-Conversion time: 1.259 seconds.
-
-
-Using this Markdown file:
-
-1. Paste this output into your source file.
-2. See the notes and action items below regarding this conversion run.
-3. Check the rendered output (headings, lists, code blocks, tables) for proper
-   formatting and use a linkchecker before you publish this page.
-
-Conversion notes:
-
-* Docs to Markdown version 1.0β34
-* Mon Apr 03 2023 06:13:02 GMT-0700 (PDT)
-* Source doc: Filtering participants
-* Tables are currently converted to HTML tables.
-* This document has images: check for >>>>>  gd2md-html alert:  inline image link in generated source and store images to your server. NOTE: Images in exported zip file from Google Docs may not appear in  the same order as they do in your doc. Please check the images!
-
------>
-
-
 <p style="color: red; font-weight: bold">>>>>>  gd2md-html alert:  ERRORs: 0; WARNINGs: 0; ALERTS: 3.</p>
 <ul style="color: red; font-weight: bold"><li>See top comment block for details on ERRORs and WARNINGs. <li>In the converted Markdown or HTML, search for inline alerts that start with >>>>>  gd2md-html alert:  for specific instances that need correction.</ul>
 
@@ -58,10 +30,8 @@ We also tested the hypothesis that daily usage of the Verily Study Watch was inf
 
 
 
-<p id="gdcalert1" ><span style="color: red; font-weight: bold">>>>>>  gd2md-html alert: inline image link here (to images/image1.png). Store image on your image server and adjust path/filename/extension if necessary. </span><br>(<a href="#">Back to top</a>)(<a href="#gdcalert2">Next alert</a>)<br><span style="color: red; font-weight: bold">>>>>> </span></p>
 
-
-![compliance](https://github.com/Andreater/parkinson_cdss/blob/main/docs/compliance.png)
+![compliance](docs/compliance.png)
 
 
 Fig.1 Summary of the compliance analysis. A) Kaplan-Meier plot illustrating the completion rate (CR) of the study for each Strata. At 1 year (52 weeks) CR was estimated at 0.53, 0.62 0.66 for HC, PD and Prodromal individuals. B) Box plot illustrating the average daily use for each strata. After the Kruskal Wallis we used the Wilcoxon rank sum test with continuity correction to generate the post hoc p-values. C) The average percentages of weekly use in approximately 1 year of the experiment (≈52 weeks). D) A forest plot representing the Cox Proportional Hazards Model that was used to test the hypothesis that clinical status and demographic features may influence the duration of the study. 
@@ -73,8 +43,6 @@ A set of 17 predictors was used to predict the UPDRS slope between the first and
 
 
 
-<p id="gdcalert2" ><span style="color: red; font-weight: bold">>>>>>  gd2md-html alert: inline image link here (to images/image2.png). Store image on your image server and adjust path/filename/extension if necessary. </span><br>(<a href="#">Back to top</a>)(<a href="#gdcalert3">Next alert</a>)<br><span style="color: red; font-weight: bold">>>>>> </span></p>
-
 
 ![performance](docs/performance.png)
 
@@ -83,9 +51,6 @@ Fig.2 Performance of the final model (fit) against the baseline (bs).
 
 These results may be explained by time influence on the UPDRS total score. While, the correlation between changes in REM sleep and UPDRS score is moderate ( ⍴ = 0.45), inspecting the STL decomposed time series of the REM sleep data demonstrates that is almost constant. This means that no significant changes or trends are visible during the first year of the experiment (fig.3). 
 
-
-
-<p id="gdcalert3" ><span style="color: red; font-weight: bold">>>>>>  gd2md-html alert: inline image link here (to images/image3.png). Store image on your image server and adjust path/filename/extension if necessary. </span><br>(<a href="#">Back to top</a>)(<a href="#gdcalert4">Next alert</a>)<br><span style="color: red; font-weight: bold">>>>>> </span></p>
 
 
 ![STL](docs/STL.png)
